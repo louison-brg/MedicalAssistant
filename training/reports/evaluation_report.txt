@@ -1,0 +1,59 @@
+=== ÉVALUATION DU MODÈLE MÉDICAL ===
+
+Perplexité : 38820.47
+
+=== Exemples de génération ===
+
+--- Exemple 1 ---
+Prompt:
+Patient: I have a persistent cough and chest pain. What could this be?
+Doctor:
+
+Réponse générée:
+Patient: I have a persistent cough and chest pain. What could this be?
+Doctor: The patient’s symptoms should be considered for an episode of fever, and a rash should be treated with a cough or pain.
+
+Infection of fever, a history of fatigue, and pain, and chest pain. The patient is most likely to be significant and is significant for the past 2 years, if the patient is not treated.
+
+Serum:
+
+Hemoglobin: 3.5 mg/dL
+
+
+Kemoglobin: 0.9 mg/dL
+
+Hemoglobin: 10 mg/dL
+
+Pregnancy: 100 mg/dL
+
+--- Exemple 2 ---
+Prompt:
+Question: What is the treatment for type 2 diabetes in obese patients?
+Answer:
+
+Réponse générée:
+Question: What is the treatment for type 2 diabetes in obese patients?
+Answer:
+Metadata: step1&3-1&3&3
+
+Metadata: step1&3&3&3&3&3&3
+Metadata: step1&3&3&3&3&3&3&3&3
+A.2&3&3&3&3&3&3&3&3&3&3&3&3&3&3&3&3
+B&3&3&3&3&3&3&3&3&3&3&3&3&3)
+
+--- Exemple 3 ---
+Prompt:
+Patient: My throat hurts and I feel feverish for 3 days. What should I do?
+Doctor:
+
+Réponse générée:
+Patient: My throat hurts and I feel feverish for 3 days. What should I do?
+Doctor:
+
+The diagnosis of fever: a history of the diagnosis of myelitis: CT and a history of fever, with severe diarrhea, pain, and fever. Aneurysm: a result of mycology, chronic myocarditis.
+
+The patient should be performed on a history of chronic myocarditis.
+
+In the past 6 years of age and age, the past week after the patient should not be evaluated by anemia, especially for the patient should not be given if the patient has a history of the patient’s symptoms.
+
+The patient’

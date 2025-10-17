@@ -1,0 +1,9 @@
+.venv/
+training/data/processed/
+training/data/raw/
+training/models/checkpoints/
+tree.md
+mlruns/
+training/.DS_Store
+training/data/.DS_Store
+.DS_Store
