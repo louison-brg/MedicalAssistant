@@ -1,128 +1,147 @@
 """
-model_training.py — version finale avec affichage bf16 garanti
+Fine-tuning Phi-3-mini local sur Mac (MPS) avec LoRA + MLflow — version finale stable
 """
 
 import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"     # bascule auto CPU si op MPS manque
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"  # éviter OOM silencieux MPS
+
 import torch
 import mlflow
 from datasets import load_from_disk
 from transformers import (
-    OPTForCausalLM,
+    AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
-    set_seed
+    set_seed,
 )
+from peft import LoraConfig, get_peft_model
 
 # ============================================================
-# 0️⃣ Configuration générale
+# CONFIG
 # ============================================================
-
-MODEL_NAME = "facebook/opt-125m"
-DATA_PATH = "training/data/processed"
-SAVE_DIR = "training/models/checkpoints"
+MODEL_PATH = "training/models/phi-3-mini-4k-instruct"
+DATA_PATH  = "training/data/processed_professor_phi3/tokenized"
+SAVE_DIR   = "training/models/checkpoints_phi3_lora"
 MLFLOW_URI = "file:./mlruns"
-MAX_LENGTH = 512
+
+EPOCHS, BATCH_SIZE, GRAD_ACCUM_STEPS = 1, 1, 8
+LR, WARMUP_STEPS, WEIGHT_DECAY = 2e-4, 200, 0.01
 
 set_seed(42)
+os.makedirs(SAVE_DIR, exist_ok=True)
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 
 # ============================================================
-# 1️⃣ Chargement du dataset
+# FIX MLflow for MacOS compatibility
 # ============================================================
+import mlflow.utils.autologging_utils
+mlflow.utils.autologging_utils._is_testing = False
+os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
 
+# ============================================================
+# DEVICE
+# ============================================================
+if torch.backends.mps.is_available():
+    device = "mps"
+    dtype = torch.float32
+    IS_MAC = True
+elif torch.cuda.is_available():
+    device = "cuda"
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    IS_MAC = False
+else:
+    device = "cpu"
+    dtype = torch.float32
+    IS_MAC = False
+
+print(f"🧠 Device: {device} | dtype: {dtype}")
+
+# ============================================================
+# DATA
+# ============================================================
 print("🔄 Chargement du dataset...")
 dataset = load_from_disk(DATA_PATH)
 split = dataset.train_test_split(test_size=0.1, seed=42)
-train_dataset = split["train"]
-eval_dataset = split["test"]
+train_dataset, eval_dataset = split["train"], split["test"]
 
-print(f"✅ Dataset chargé et divisé :")
-print(f"   - Train : {len(train_dataset)} exemples")
-print(f"   - Validation : {len(eval_dataset)} exemples")
+if IS_MAC:
+    # mode test allégé
+    train_dataset = train_dataset.select(range(500))
+    eval_dataset  = eval_dataset.select(range(100))
+    print("⚠️ Mode test activé : 500 exemples train / 100 val.")
+
+print(f"✅ Dataset : {len(train_dataset)} train / {len(eval_dataset)} val")
 
 # ============================================================
-# 2️⃣ Tokenizer + Modèle
+# TOKENIZER + MODEL
 # ============================================================
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
 if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    tokenizer.pad_token = tokenizer.eos_token
 
-model = OPTForCausalLM.from_pretrained(MODEL_NAME)
-model.resize_token_embeddings(len(tokenizer))
-
-# Force init MPS avant détection bf16
-if torch.backends.mps.is_available():
-    torch.zeros(1, device="mps")
-
-device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+print("📦 Chargement du modèle Phi-3 local…")
+model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=dtype)
 model.to(device)
-print(f"✅ Utilisation du device : {device}")
+print("✅ Modèle chargé.")
 
 # ============================================================
-# 3️⃣ Vérification bf16
+# LORA CONFIG + INJECTION
 # ============================================================
+targets = []
+for name, _ in model.named_modules():
+    if any(x in name for x in ["q_proj", "v_proj", "o_proj", "dense", "Wqkv"]):
+        targets.append(name.split('.')[-1])
+targets = list(set(targets))
+print(f"🎯 Modules LoRA détectés: {targets}")
 
-use_bf16 = False
-bf16_supported = False
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=targets,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
 
-if device == "mps":
-    try:
-        x = torch.randn(2, 2, device="mps", dtype=torch.bfloat16)
-        _ = x @ x
-        bf16_supported = True
-    except Exception as e:
-        print(f"⚠️ bf16 non supporté sur MPS : {e}")
+model = get_peft_model(model, lora_config)
+model.to(device)
+model.train()
 
-elif device == "cuda":
-    bf16_supported = torch.cuda.is_bf16_supported()
-
-use_bf16 = bf16_supported
-if bf16_supported:
-    print("✅ bf16 activé et pris en charge sur ce device.")
-else:
-    print("⚠️ bf16 non pris en charge, fallback en float32.")
-
-print(f"📦 Type de poids initiaux : {next(model.parameters()).dtype}")
-print(f"🎯 Mode d’entraînement choisi : {'bfloat16' if use_bf16 else 'float32'}")
+trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+print(f"✅ {len(trainable)} paramètres entraînables détectés.")
+if len(trainable) == 0:
+    raise RuntimeError("❌ Aucun paramètre entraînable ! Vérifie le device ou les modules LoRA.")
 
 # ============================================================
-# 4️⃣ Configuration de l'entraînement
+# MLFLOW INIT
 # ============================================================
+mlflow.set_tracking_uri(MLFLOW_URI)
+mlflow.set_experiment("phi3-medical-professor")
 
+# ============================================================
+# TRAINING SETUP
+# ============================================================
 training_args = TrainingArguments(
     output_dir=SAVE_DIR,
-    num_train_epochs=3,
-    per_device_train_batch_size=4,
-    per_device_eval_batch_size=4,
-    warmup_steps=100,
-    weight_decay=0.01,
-    logging_dir='./logs',
-    logging_steps=10,
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+    learning_rate=LR,
+    weight_decay=WEIGHT_DECAY,
+    warmup_steps=WARMUP_STEPS,
+    logging_steps=50,
+    save_steps=500,
     save_strategy="steps",
-    save_steps=100,
-    eval_strategy="steps",
-    eval_steps=100,
-    save_total_limit=2,
-    load_best_model_at_end=True,
+    dataloader_pin_memory=not IS_MAC,
     report_to=["mlflow"],
-    bf16=use_bf16,
     fp16=False,
+    bf16=False
 )
 
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-mlflow.set_tracking_uri(MLFLOW_URI)
-mlflow.set_experiment("medical-llm-training")
-
-# ============================================================
-# 5️⃣ Entraînement
-# ============================================================
-
-# Vérifie le dtype effectif du modèle
-print(f"🧠 Dtype effectif du modèle après move : {next(model.parameters()).dtype}")
-print(f"🧮 bf16 flag dans TrainingArguments : {training_args.bf16}")
 
 trainer = Trainer(
     model=model,
@@ -132,15 +151,25 @@ trainer = Trainer(
     data_collator=data_collator,
 )
 
-print("🚀 Début de l'entraînement...")
+# ============================================================
+# TRAIN
+# ============================================================
+print("🚀 Début du fine-tuning LoRA (MPS + MLflow)…")
+torch.set_grad_enabled(True)
+model.train()
 trainer.train()
 
+# ============================================================
+# EVAL
+# ============================================================
+print("📊 Évaluation post-entraînement…")
+results = trainer.evaluate()
+print("✅ Résultats :", results)
 
 # ============================================================
-# 6️⃣ Sauvegarde
+# SAVE
 # ============================================================
-
-print("💾 Sauvegarde du modèle final...")
-trainer.save_model()
+print("💾 Sauvegarde du modèle LoRA…")
+model.save_pretrained(SAVE_DIR)
 tokenizer.save_pretrained(SAVE_DIR)
-print("✨ Entraînement terminé avec succès !")
+print("✨ Terminé avec succès !")

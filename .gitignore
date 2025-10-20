@@ -7,3 +7,8 @@ mlruns/
 training/.DS_Store
 training/data/.DS_Store
 .DS_Store
+training/data/processed_professor_phi3/
+training/models/phi-3-mini-4k-instruct/
+adapters/
+training/models/phi3-mlx-4bit/
+training/data/mlx_data/

@@ -1,44 +1,37 @@
 """
-prepare_professor_dataset_phi3.py
----------------------------------
-Crée un dataset “Student–Professor” pour le fine-tuning du modèle Phi-3-mini.
-Sources :
- - MedQA (USMLE)
- - Textbooks médicaux anglais (.txt)
- - MedDialog (anglais)
+prepare_professor_dataset_mlx_final.py
+--------------------------------------
+Crée un dataset “Student–Professor” propre et compatible MLX :
+- Fusionne MedQA, Textbooks et MedDialog
+- Nettoie et vérifie les exemples
+- Split en train / eval
+- Sauvegarde en JSONL (MLX-ready)
 """
 
 import os
+import json
+import random
 from datasets import load_dataset, concatenate_datasets, Dataset
-from transformers import AutoTokenizer
-from tqdm import tqdm
 
 # ==========================================================
 # ⚙️ Configuration
 # ==========================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SAVE_DIR = os.path.join(BASE_DIR, "processed_professor_phi3")
+SAVE_DIR = os.path.join(BASE_DIR, "mlx_data")
 RAW_DIR = os.path.join(BASE_DIR, "raw")
-
-TOKENIZER_MODEL = "microsoft/phi-3-mini-4k-instruct"
-MAX_LENGTH = 512
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-print("🚀 Création du dataset Prof–Étudiant pour Phi-3...\n")
+TRAIN_RATIO = 0.9  # 90% train, 10% eval
+MIN_TEXT_LEN = 50  # éviter les dialogues trop courts
 
-# Initialisation du tokenizer
-tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, use_fast=True)
-if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-
-print(f"✅ Tokenizer chargé : {TOKENIZER_MODEL}\n")
+print("🚀 Création du dataset Prof–Étudiant (format MLX)...\n")
 
 # ==========================================================
 # 1️⃣ MedQA (USMLE)
 # ==========================================================
 def format_medqa(example):
-    q = example.get("question", "")
+    q = example.get("question", "").strip()
     opts = example.get("options", {})
     ans = example.get("answer", "")
     meta = example.get("meta_info", "")
@@ -56,13 +49,15 @@ def format_medqa(example):
     )
     return {"text": text}
 
+
 print("📘 Chargement de MedQA (USMLE)...")
 MEDQA_PATH = os.path.join(RAW_DIR, "med_qa/data_clean/data_clean/questions/US/train.jsonl")
 medqa = load_dataset("json", data_files=MEDQA_PATH)["train"].map(format_medqa)
 print(f"✅ MedQA formaté : {len(medqa)} exemples\n")
 
+
 # ==========================================================
-# 2️⃣ Textbooks anglais (.txt)
+# 2️⃣ Textbooks anglais
 # ==========================================================
 print("📚 Chargement des textbooks anglais...")
 TEXTBOOK_DIR = os.path.join(RAW_DIR, "med_qa/data_clean/data_clean/textbooks/en")
@@ -73,7 +68,7 @@ for filename in os.listdir(TEXTBOOK_DIR):
         path = os.path.join(TEXTBOOK_DIR, filename)
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read().strip()
-            if len(content) > 200:
+            if len(content) > MIN_TEXT_LEN:
                 title = os.path.splitext(filename)[0].replace("_", " ").title()
                 text_data.append({
                     "text": f"Student: Can you explain the topic of {title}?\nProfessor: {content}"
@@ -82,77 +77,72 @@ for filename in os.listdir(TEXTBOOK_DIR):
 textbooks = Dataset.from_list(text_data)
 print(f"✅ Textbooks formatés : {len(textbooks)} exemples\n")
 
+
 # ==========================================================
 # 3️⃣ MedDialog (anglais)
 # ==========================================================
 print("💬 Chargement de MedDialog...")
-
 def format_meddialog(example):
     desc = example.get("description", "")
     utts = example.get("utterances", [])
     dialogue = " ".join(utts).replace("patient:", "student:").replace("doctor:", "professor:")
-    text = f"Case: {desc}\n{dialogue}"
-    return {"text": text}
+    return {"text": f"Case: {desc}\n{dialogue}"}
 
 MEDDIALOG_PATH = os.path.join(BASE_DIR, "processed/english-train.json")
 meddialog = load_dataset("json", data_files=MEDDIALOG_PATH)["train"].map(format_meddialog)
 print(f"✅ MedDialog formaté : {len(meddialog)} exemples\n")
 
+
 # ==========================================================
-# 4️⃣ Fusion
+# 4️⃣ Fusion + Nettoyage
 # ==========================================================
 print("🧩 Fusion de tous les datasets...")
 combined = concatenate_datasets([medqa, textbooks, meddialog])
-print(f"✅ Total : {len(combined)} exemples combinés\n")
+print(f"✅ Total initial : {len(combined)} exemples combinés")
+
+print("🧹 Nettoyage des exemples trop courts...")
+filtered = combined.filter(lambda x: len(x["text"]) > MIN_TEXT_LEN)
+print(f"✅ {len(filtered)} exemples conservés après nettoyage\n")
+
 
 # ==========================================================
-# 5️⃣ Sauvegarde non-tokenisée
+# 5️⃣ Split en train / eval
 # ==========================================================
-RAW_SAVE_PATH = os.path.join(SAVE_DIR, "raw_text_dataset")
-combined.save_to_disk(RAW_SAVE_PATH)
-print(f"💾 Dataset texte sauvegardé : {RAW_SAVE_PATH}\n")
+print("✂️ Split en train / validation (90/10)...")
+filtered = filtered.shuffle(seed=42)
+split_idx = int(len(filtered) * TRAIN_RATIO)
+train_dataset = filtered.select(range(split_idx))
+eval_dataset = filtered.select(range(split_idx, len(filtered)))
 
-# ==========================================================
-# 6️⃣ Tokenisation
-# ==========================================================
-def tokenize_function(example):
-    tokens = tokenizer(example["text"], truncation=False)
-    input_ids = tokens["input_ids"]
-    result_input_ids, result_attention_masks = [], []
+print(f"✅ Train : {len(train_dataset)} exemples")
+print(f"✅ Eval  : {len(eval_dataset)} exemples\n")
 
-    for i in range(0, len(input_ids), MAX_LENGTH):
-        chunk = input_ids[i:i + MAX_LENGTH]
-        attention_mask = [1] * len(chunk)
-
-        if len(chunk) < MAX_LENGTH:
-            pad_len = MAX_LENGTH - len(chunk)
-            chunk += [tokenizer.pad_token_id] * pad_len
-            attention_mask += [0] * pad_len
-
-        result_input_ids.append(chunk)
-        result_attention_masks.append(attention_mask)
-
-    return {"input_ids": result_input_ids, "attention_mask": result_attention_masks}
-
-print("🔠 Tokenisation avec Phi-3 tokenizer...")
-temp_dataset = combined.map(tokenize_function, batched=False, remove_columns=combined.column_names)
-
-flat_input_ids, flat_attention_masks = [], []
-for ex in temp_dataset:
-    for i in range(len(ex["input_ids"])):
-        flat_input_ids.append(ex["input_ids"][i])
-        flat_attention_masks.append(ex["attention_mask"][i])
-
-tokenized_dataset = Dataset.from_dict({
-    "input_ids": flat_input_ids,
-    "attention_mask": flat_attention_masks
-})
-
-print(f"✅ {len(tokenized_dataset):,} séquences prêtes pour l’entraînement")
 
 # ==========================================================
-# 7️⃣ Sauvegarde finale
+# 6️⃣ Sauvegarde JSONL (format MLX)
 # ==========================================================
-TOKENIZED_PATH = os.path.join(SAVE_DIR, "tokenized")
-tokenized_dataset.save_to_disk(TOKENIZED_PATH)
-print(f"🎉 Dataset tokenisé sauvegardé dans : {TOKENIZED_PATH}\n")
+def save_jsonl(dataset, path):
+    with open(path, "w", encoding="utf-8") as f:
+        for ex in dataset:
+            text = ex["text"].strip().replace("\n\n", "\n")
+            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+
+TRAIN_PATH = os.path.join(SAVE_DIR, "train.jsonl")
+VALID_PATH = os.path.join(SAVE_DIR, "valid.jsonl")
+
+print("💾 Sauvegarde des fichiers...")
+save_jsonl(train_dataset, TRAIN_PATH)
+save_jsonl(eval_dataset, VALID_PATH)
+
+print(f"✅ Train : {TRAIN_PATH}")
+print(f"✅ valid  : {VALID_PATH}\n")
+
+# ==========================================================
+# 7️⃣ Vérification rapide du contenu
+# ==========================================================
+print("🔍 Exemples aléatoires :\n")
+for i in random.sample(range(len(train_dataset)), min(3, len(train_dataset))):
+    print(f"--- Exemple {i} ---")
+    print(train_dataset[i]["text"][:500], "...\n")
+
+print("🎉 Dataset MLX complet et prêt à l'emploi !")
