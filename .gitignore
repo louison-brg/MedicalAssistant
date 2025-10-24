@@ -15,6 +15,7 @@ training/data/mlx_data/
 training/models/phi3-medprof-merged-4bit/
 training/models/phi3-medprof-merged/
 training/models/phi3-medprof-fp16/
+training/models/phi3-medprof_final_full/
 ios_app/MedicalAssistant/MedicalAssistant.xcodeproj/
 ios_app/MedicalAssistant/MedicalAssistantUITests/
 ios_app/MedicalAssistant/MedicalAssistant/Assets.xcassets/
@@ -22,4 +23,5 @@ ios_app/MedicalAssistant/MedicalLLM.mlpackage/
 ios_app/MedicalAssistant/MedicalAssistantTests/
 ios_app/MedicalAssistant/MedicalAssistant/merges.txt
 ios_app/MedicalAssistant/MedicalAssistant/vocab.json
+ios_app/MedicalAssistant/MedicalAssistant/MedicalLLM.mlpackage/
 model_export/phi3-medprof-mlx_weights.npz
