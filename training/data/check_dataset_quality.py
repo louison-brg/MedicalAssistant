@@ -1,6 +1,10 @@
 import numpy as np
 import re
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+    HAS_PLOT = True
+except Exception:
+    HAS_PLOT = False
 from collections import Counter
 from datasets import load_from_disk
 
@@ -8,7 +12,7 @@ from datasets import load_from_disk
 # 🔍 Analyse complète du dataset avant fine-tuning
 # ==========================================================
 
-DATA_PATH = "training/data/processed" 
+DATA_PATH = "training/data/processed_professor_phi3/tokenized"
 
 print("📦 Chargement du dataset depuis :", DATA_PATH)
 dataset = load_from_disk(DATA_PATH)
@@ -34,13 +38,18 @@ if "input_ids" in dataset.column_names:
     print(f"   - Médiane : {np.median(lengths):.1f}")
     print(f"   - Maximum : {np.max(lengths)}")
 
-    plt.hist(lengths, bins=50)
-    plt.title("Distribution de la longueur des séquences")
-    plt.xlabel("Nombre de tokens")
-    plt.ylabel("Fréquence")
-    plt.show()
+    if HAS_PLOT:
+        plt.hist(lengths, bins=50)
+        plt.title("Distribution de la longueur des séquences")
+        plt.xlabel("Nombre de tokens")
+        plt.ylabel("Fréquence")
+        plt.show()
+    else:
+        print("ℹ️ matplotlib non installé — histogramme ignoré.")
 else:
     print("\n⚠️ Pas de colonne 'input_ids' — le dataset n’est pas encore tokenisé.")
+
+empty = []
 
 # ==========================================================
 # 🧩 Étape 3 — Détection d’exemples vides

@@ -1,14 +1,18 @@
 """
-Fine-tuning Phi-3-mini local sur Mac (MPS) avec LoRA + MLflow — version finale stable
+Fine-tuning Phi-3-mini local (MPS/CUDA/CPU) with LoRA + optional MLflow.
+Provides a CLI to keep paths and hyperparams consistent.
 """
 
+import argparse
 import os
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"     # bascule auto CPU si op MPS manque
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"  # éviter OOM silencieux MPS
+from typing import List, Optional
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # auto CPU fallback for missing MPS ops
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")  # avoid silent MPS OOM
 
 import torch
 import mlflow
-from datasets import load_from_disk
+from datasets import load_from_disk, DatasetDict
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -19,157 +23,194 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
-# ============================================================
-# CONFIG
-# ============================================================
-MODEL_PATH = "training/models/phi-3-mini-4k-instruct"
-DATA_PATH  = "training/data/processed_professor_phi3/tokenized"
-SAVE_DIR   = "training/models/checkpoints_phi3_lora"
-MLFLOW_URI = "file:./mlruns"
 
-EPOCHS, BATCH_SIZE, GRAD_ACCUM_STEPS = 1, 1, 8
-LR, WARMUP_STEPS, WEIGHT_DECAY = 2e-4, 200, 0.01
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LoRA fine-tuning for Phi-3-mini.")
+    parser.add_argument("--model-path", default="training/models/phi-3-mini-4k-instruct", help="HF model path")
+    parser.add_argument("--data-path", default="training/data/processed_professor_phi3/tokenized", help="Tokenized dataset")
+    parser.add_argument("--save-dir", default="training/models/checkpoints_phi3_lora", help="Output directory")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval-split", type=float, default=0.1, help="If dataset is not a dict")
+    parser.add_argument("--max-train-samples", type=int, default=None)
+    parser.add_argument("--max-eval-samples", type=int, default=None)
+    parser.add_argument("--device", choices=["auto", "mps", "cuda", "cpu"], default="auto")
+    parser.add_argument("--disable-mlflow", action="store_true")
+    parser.add_argument("--mlflow-uri", default="file:./mlruns")
+    parser.add_argument("--mlflow-experiment", default="phi3-medical-professor")
+    parser.add_argument("--save-steps", type=int, default=500)
+    parser.add_argument("--logging-steps", type=int, default=50)
+    parser.add_argument("--resume-from-checkpoint", default=None)
+    parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-targets", default="", help="Comma-separated target modules (optional)")
+    parser.add_argument("--quick", action="store_true", help="Limit data for a fast smoke run")
+    return parser.parse_args()
 
-set_seed(42)
-os.makedirs(SAVE_DIR, exist_ok=True)
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 
-# ============================================================
-# FIX MLflow for MacOS compatibility
-# ============================================================
-import mlflow.utils.autologging_utils
-mlflow.utils.autologging_utils._is_testing = False
-os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
+def resolve_device(requested: str) -> tuple[str, torch.dtype, bool]:
+    if requested != "auto":
+        device = requested
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
 
-# ============================================================
-# DEVICE
-# ============================================================
-if torch.backends.mps.is_available():
-    device = "mps"
-    dtype = torch.float32
-    IS_MAC = True
-elif torch.cuda.is_available():
-    device = "cuda"
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    IS_MAC = False
-else:
-    device = "cpu"
-    dtype = torch.float32
-    IS_MAC = False
+    if device == "mps":
+        dtype = torch.float32
+    elif device == "cuda":
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        dtype = torch.float32
+    return device, dtype, device == "mps"
 
-print(f"🧠 Device: {device} | dtype: {dtype}")
 
-# ============================================================
-# DATA
-# ============================================================
-print("🔄 Chargement du dataset...")
-dataset = load_from_disk(DATA_PATH)
-split = dataset.train_test_split(test_size=0.1, seed=42)
-train_dataset, eval_dataset = split["train"], split["test"]
+def detect_lora_targets(model) -> List[str]:
+    targets: List[str] = []
+    for name, _ in model.named_modules():
+        if any(x in name for x in ["q_proj", "k_proj", "v_proj", "o_proj", "dense", "Wqkv"]):
+            targets.append(name.split(".")[-1])
+    return sorted(set(targets))
 
-if IS_MAC:
-    # mode test allégé
-    train_dataset = train_dataset.select(range(500))
-    eval_dataset  = eval_dataset.select(range(100))
-    print("⚠️ Mode test activé : 500 exemples train / 100 val.")
 
-print(f"✅ Dataset : {len(train_dataset)} train / {len(eval_dataset)} val")
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+    os.makedirs(args.save_dir, exist_ok=True)
 
-# ============================================================
-# TOKENIZER + MODEL
-# ============================================================
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+    # MLflow compatibility on macOS
+    import mlflow.utils.autologging_utils
 
-print("📦 Chargement du modèle Phi-3 local…")
-model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=dtype)
-model.to(device)
-print("✅ Modèle chargé.")
+    mlflow.utils.autologging_utils._is_testing = False
+    os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
 
-# ============================================================
-# LORA CONFIG + INJECTION
-# ============================================================
-targets = []
-for name, _ in model.named_modules():
-    if any(x in name for x in ["q_proj", "v_proj", "o_proj", "dense", "Wqkv"]):
-        targets.append(name.split('.')[-1])
-targets = list(set(targets))
-print(f"🎯 Modules LoRA détectés: {targets}")
+    device, dtype, is_mac = resolve_device(args.device)
+    print(f"🧠 Device: {device} | dtype: {dtype}")
 
-lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    target_modules=targets,
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM"
-)
+    # Data loading
+    print("🔄 Loading dataset...")
+    dataset = load_from_disk(args.data_path)
+    if isinstance(dataset, DatasetDict):
+        train_dataset = dataset.get("train") or dataset.get("training") or next(iter(dataset.values()))
+        eval_dataset = dataset.get("validation") or dataset.get("eval") or dataset.get("test")
+        if eval_dataset is None:
+            split = train_dataset.train_test_split(test_size=args.eval_split, seed=args.seed)
+            train_dataset, eval_dataset = split["train"], split["test"]
+    else:
+        split = dataset.train_test_split(test_size=args.eval_split, seed=args.seed)
+        train_dataset, eval_dataset = split["train"], split["test"]
 
-model = get_peft_model(model, lora_config)
-model.to(device)
-model.train()
+    if args.quick or is_mac:
+        max_train = args.max_train_samples or 500
+        max_eval = args.max_eval_samples or 100
+        train_dataset = train_dataset.select(range(min(max_train, len(train_dataset))))
+        eval_dataset = eval_dataset.select(range(min(max_eval, len(eval_dataset))))
+        print(f"⚠️ Quick mode: {len(train_dataset)} train / {len(eval_dataset)} eval")
+    else:
+        if args.max_train_samples:
+            train_dataset = train_dataset.select(range(min(args.max_train_samples, len(train_dataset))))
+        if args.max_eval_samples:
+            eval_dataset = eval_dataset.select(range(min(args.max_eval_samples, len(eval_dataset))))
 
-trainable = [n for n, p in model.named_parameters() if p.requires_grad]
-print(f"✅ {len(trainable)} paramètres entraînables détectés.")
-if len(trainable) == 0:
-    raise RuntimeError("❌ Aucun paramètre entraînable ! Vérifie le device ou les modules LoRA.")
+    print(f"✅ Dataset: {len(train_dataset)} train / {len(eval_dataset)} eval")
 
-# ============================================================
-# MLFLOW INIT
-# ============================================================
-mlflow.set_tracking_uri(MLFLOW_URI)
-mlflow.set_experiment("phi3-medical-professor")
+    # Tokenizer + model
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-# ============================================================
-# TRAINING SETUP
-# ============================================================
-training_args = TrainingArguments(
-    output_dir=SAVE_DIR,
-    num_train_epochs=EPOCHS,
-    per_device_train_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=GRAD_ACCUM_STEPS,
-    learning_rate=LR,
-    weight_decay=WEIGHT_DECAY,
-    warmup_steps=WARMUP_STEPS,
-    logging_steps=50,
-    save_steps=500,
-    save_strategy="steps",
-    dataloader_pin_memory=not IS_MAC,
-    report_to=["mlflow"],
-    fp16=False,
-    bf16=False
-)
+    print("📦 Loading Phi-3 model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+        attn_implementation="eager",
+    )
+    model.config.use_cache = False
+    model.to(device)
+    print("✅ Model loaded.")
 
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # LoRA config
+    if args.lora_targets:
+        targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
+    else:
+        targets = detect_lora_targets(model)
+    print(f"🎯 LoRA target modules: {targets}")
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    data_collator=data_collator,
-)
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=targets,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
 
-# ============================================================
-# TRAIN
-# ============================================================
-print("🚀 Début du fine-tuning LoRA (MPS + MLflow)…")
-torch.set_grad_enabled(True)
-model.train()
-trainer.train()
+    model = get_peft_model(model, lora_config)
+    model.to(device)
+    model.train()
 
-# ============================================================
-# EVAL
-# ============================================================
-print("📊 Évaluation post-entraînement…")
-results = trainer.evaluate()
-print("✅ Résultats :", results)
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    print(f"✅ {len(trainable)} trainable parameters.")
+    if len(trainable) == 0:
+        raise RuntimeError("No trainable parameters. Check device or LoRA targets.")
 
-# ============================================================
-# SAVE
-# ============================================================
-print("💾 Sauvegarde du modèle LoRA…")
-model.save_pretrained(SAVE_DIR)
-tokenizer.save_pretrained(SAVE_DIR)
-print("✨ Terminé avec succès !")
+    # MLflow
+    report_to = []
+    if not args.disable_mlflow:
+        mlflow.set_tracking_uri(args.mlflow_uri)
+        mlflow.set_experiment(args.mlflow_experiment)
+        report_to = ["mlflow"]
+
+    # Training args
+    training_args = TrainingArguments(
+        output_dir=args.save_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_steps=args.warmup_steps,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        save_strategy="steps",
+        dataloader_pin_memory=not is_mac,
+        report_to=report_to,
+        fp16=False,
+        bf16=False,
+    )
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+    )
+
+    print("🚀 Starting LoRA fine-tuning...")
+    torch.set_grad_enabled(True)
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+
+    print("📊 Post-training evaluation...")
+    results = trainer.evaluate()
+    print("✅ Eval results:", results)
+
+    print("💾 Saving LoRA adapters...")
+    model.save_pretrained(args.save_dir)
+    tokenizer.save_pretrained(args.save_dir)
+    print("✨ Done.")
+
+
+if __name__ == "__main__":
+    main()

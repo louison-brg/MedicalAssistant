@@ -5,6 +5,7 @@ from transformers import AutoTokenizer, OPTForCausalLM
 # ------------------------------------------------
 # 1️⃣ Charger le modèle pré-entraîné
 # ------------------------------------------------
+# NOTE: Legacy OPT-350m converter kept for reference.
 model_name = "facebook/opt-350m"  # Un bon compromis taille/performance
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = OPTForCausalLM.from_pretrained(model_name)
