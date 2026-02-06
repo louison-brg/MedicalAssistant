@@ -1,0 +1,4 @@
+# macOS-only tooling (CoreML export + MLX)
+coremltools>=7.0
+mlx>=0.20.0
+mlx-lm>=0.15.0

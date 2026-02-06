@@ -1,4 +1,6 @@
 .venv/
+__pycache__/
+*.pyc
 training/data/processed/
 training/data/raw/
 training/models/checkpoints/
@@ -24,4 +26,12 @@ ios_app/MedicalAssistant/MedicalAssistantTests/
 ios_app/MedicalAssistant/MedicalAssistant/merges.txt
 ios_app/MedicalAssistant/MedicalAssistant/vocab.json
 ios_app/MedicalAssistant/MedicalAssistant/MedicalLLM.mlpackage/
+ios_app/MedicalAssistant/MedicalAssistant/MedicalLLM*.mlpackage/
+ios_app/MedicalAssistant/MedicalAssistant/*.mlmodelc/
+ios_app/.../
+exports/
+logs/
+models/
+model_export/__pycache__/
+model_export/.coreml_tmp/
 model_export/phi3-medprof-mlx_weights.npz

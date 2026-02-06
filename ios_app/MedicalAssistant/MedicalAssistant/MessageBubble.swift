@@ -9,7 +9,7 @@ struct MessageBubble: View {
                 Spacer()
             }
             
-            Text(message.text)
+            Text(message.text.isEmpty ? "..." : message.text)
                 .padding(12)
                 .background(message.isUser ? Color.blue.opacity(0.85) : Color.gray.opacity(0.25))
                 .foregroundColor(message.isUser ? .white : .primary)
@@ -17,6 +17,8 @@ struct MessageBubble: View {
                 .frame(maxWidth: 280, alignment: message.isUser ? .trailing : .leading)
                 .padding(message.isUser ? .leading : .trailing, 40)
                 .padding(.vertical, 4)
+                .italic(message.isPartial)
+                .opacity(message.isPartial ? 0.8 : 1.0)
             
             if !message.isUser {
                 Spacer()
