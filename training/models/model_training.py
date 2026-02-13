@@ -7,8 +7,8 @@ import argparse
 import os
 from typing import List, Optional
 
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # auto CPU fallback for missing MPS ops
-os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")  # avoid silent MPS OOM
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1") 
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0") 
 
 import torch
 import mlflow
@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--lora-targets", default="", help="Comma-separated target modules (optional)")
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable dynamic model code loading from local/Hub files when required.",
+    )
     parser.add_argument("--quick", action="store_true", help="Limit data for a fast smoke run")
     return parser.parse_args()
 
@@ -65,7 +70,7 @@ def resolve_device(requested: str) -> tuple[str, torch.dtype, bool]:
         device = "cpu"
 
     if device == "mps":
-        dtype = torch.float32
+        dtype = torch.float16
     elif device == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     else:
@@ -108,7 +113,7 @@ def main() -> None:
         split = dataset.train_test_split(test_size=args.eval_split, seed=args.seed)
         train_dataset, eval_dataset = split["train"], split["test"]
 
-    if args.quick or is_mac:
+    if args.quick:
         max_train = args.max_train_samples or 500
         max_eval = args.max_eval_samples or 100
         train_dataset = train_dataset.select(range(min(max_train, len(train_dataset))))
@@ -123,7 +128,11 @@ def main() -> None:
     print(f"✅ Dataset: {len(train_dataset)} train / {len(eval_dataset)} eval")
 
     # Tokenizer + model
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        use_fast=True,
+        trust_remote_code=args.trust_remote_code,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -131,7 +140,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
-        trust_remote_code=True,
+        trust_remote_code=args.trust_remote_code,
         attn_implementation="eager",
     )
     model.config.use_cache = False
@@ -188,7 +197,16 @@ def main() -> None:
         bf16=False,
     )
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    _base_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    def data_collator(features):
+        """Wrap base collator to mask padding in labels (set to -100)."""
+        batch = _base_collator(features)
+        if "labels" in batch and tokenizer.pad_token_id is not None:
+            labels = batch["labels"]
+            labels[labels == tokenizer.pad_token_id] = -100
+            batch["labels"] = labels
+        return batch
 
     trainer = Trainer(
         model=model,

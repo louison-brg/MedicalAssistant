@@ -155,14 +155,35 @@ def main() -> None:
     torch._C._jit_set_profiling_executor(False)
 
     # Charge en float32 puis cast si besoin (plus sûr côté CPU).
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float32,
-        device_map="cpu",
-        trust_remote_code=True,
-        attn_implementation="eager",
-        use_cache=False,
-    )
+    # Manual loading to bypass transformers 4.43 sharding bug
+    print("⏳ Manually loading model weights (bypassing from_pretrained bug)...")
+    from transformers import AutoConfig, Phi3ForCausalLM
+    from safetensors.torch import load_file
+    import glob
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # Ensure no auto_map if present (we removed it, but good to be safe)
+    if hasattr(config, "auto_map"):
+        del config.auto_map
+
+    base_model = Phi3ForCausalLM(config)
+    
+    # Load all safetensors shards
+    state_dict = {}
+    safetensor_files = sorted(glob.glob(str(Path(model_path) / "*.safetensors")))
+    print(f"📂 Found {len(safetensor_files)} safetensor shards: {[f.split('/')[-1] for f in safetensor_files]}")
+    
+    for sf in safetensor_files:
+        print(f"   -> Loading {sf}...")
+        shard = load_file(sf)
+        state_dict.update(shard)
+
+    print("🔧 Applying state_dict...")
+    keys = base_model.load_state_dict(state_dict, strict=False)
+    print(f"✅ Weights loaded. Missing: {len(keys.missing_keys)}, Unexpected: {len(keys.unexpected_keys)}")
+    if len(keys.missing_keys) > 0:
+        print(f"⚠️ Missing keys details: {keys.missing_keys[:5]}...")
+    
     base_model.eval()
 
     target_dtype = torch.float16 if args.precision == "float16" else torch.float32
@@ -170,7 +191,8 @@ def main() -> None:
         print(f"🔁 Conversion du modèle en {target_dtype}")
         base_model.to(dtype=target_dtype)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    print("⏳ Loading tokenizer from base model (to avoid JSON version mismatch)...")
+    tokenizer = AutoTokenizer.from_pretrained("training/models/phi-3-mini-4k-instruct")
 
     print("🔍 Préparation d'un exemple pour le traçage…")
     example = tokenizer(

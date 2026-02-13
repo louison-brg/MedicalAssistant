@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlflow-uri", default="file:./mlruns")
     parser.add_argument("--mlflow-experiment", default="model-evaluation")
     parser.add_argument("--prompt-file", default=None, help="Optional file with one prompt per line")
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable dynamic model code loading from local/Hub files when required.",
+    )
     return parser.parse_args()
 
 
@@ -76,14 +81,18 @@ def main() -> None:
     print(f"✅ Using device: {device} | dtype: {dtype}")
 
     print("📦 Loading model and tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        trust_remote_code=args.trust_remote_code,
+        use_fast=True,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
-        trust_remote_code=True,
+        trust_remote_code=args.trust_remote_code,
         attn_implementation="eager",
     ).to(device)
 
