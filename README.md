@@ -1,164 +1,72 @@
-# 🧠 MedLLM iOS
+# MedLLM iOS (MLX)
 
-### Local Medical Language Model for iPhone & iPad
+Medical assistant LLM that runs locally on iPhone via a native Swift + MLX runtime.
 
----
+## Repository layout
+- `training/` data prep, tokenization, fine-tuning, eval
+- `model_export/` MLX debugging utilities
+- `ios_app/` iOS SwiftUI app with MLX inference
+- `training/models/` local model checkpoints and merged/quantized weights
 
-## 📋 Overview
-
-**MedLLM iOS** is an experimental project that aims to build a **medical language model (LLM)** capable of running **entirely offline** on iPhone and iPad devices.
-
-The goal is to combine:
-- 🤖 **Deep learning & NLP** (PyTorch / Hugging Face)
-- 📱 **On-device inference** (CoreML + SwiftUI)
-- ⚙️ **MLOps tools** (MLflow, export tooling)
-
----
-
-## 🧩 Project Goals
-
-- Build and fine-tune a **custom medical LLM** (MedQA, MedDialog, textbooks)
-- Optimize the model for **Apple Silicon** and on-device runtime
-- Deploy locally via **CoreML** in a native **SwiftUI app**
-- Track experiments and keep export steps reproducible
-
----
-
-## 📁 Repository Layout
-
-- `training/` — data preparation, training, evaluation
-- `model_export/` — CoreML conversion + validation tools
-- `ios_app/` — SwiftUI app + on-device inference code
-- `models/`, `adapters/`, `exports/`, `mlruns/` — local artifacts (not meant for Git)
-
-## 🧹 Artifact Management
-
-Large binaries should live outside Git (Git LFS, DVC, or an artifact store):
-- model weights (`*.safetensors`, `*.bin`, `*.npz`)
-- CoreML packages (`*.mlpackage`)
-- experiment logs (`mlruns/`)
-
----
-
-## ✅ Quickstart (Python)
-
+## Setup
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-macOS export + MLX extras:
-
-```bash
 pip install -r requirements-macos.txt
 ```
 
-Dev tools:
-
+## Data pipeline (MLX)
+1. Build conversation-style JSONL:
 ```bash
-pip install -r requirements-dev.txt
+python3 training/data/make_mlx_jsonl.py
 ```
 
----
-
-## 📚 Data Preparation
-
-> ⚠️ Ensure you have the rights to use any datasets or textbooks.
-
-Prepare the HF tokenized dataset (Phi‑3):
-
+2. (Optional) Build Hugging Face tokenized dataset (for HF diagnostics only):
 ```bash
-python training/data/prepare_datasets.py
+python3 training/data/prepare_datasets.py
 ```
 
-Prepare MLX JSONL (optional):
+Output path:
+- `training/data/processed_professor_phi3_hf`
 
+## Fine-tuning (LoRA)
 ```bash
-python training/data/prepare_datasets_mlx.py
-```
-
----
-
-## 🏋️ Training (LoRA)
-
-```bash
-python training/models/model_training.py \
+python3 training/models/model_training.py \
   --model-path training/models/phi-3-mini-4k-instruct \
-  --data-path training/data/processed_professor_phi3/tokenized \
-  --save-dir training/models/checkpoints_phi3_lora
+  --data-path training/data/mlx_data \
+  --adapter-path training/models/checkpoints_phi3_mlx
 ```
 
-Merge LoRA into a standalone checkpoint (for export):
+Legacy PyTorch trainer is still available at:
+- `training/models/model_training_hf.py`
 
+## Evaluation
 ```bash
-python training/models/merge_lora.py \
-  --base-model training/models/phi-3-mini-4k-instruct \
-  --adapter training/models/checkpoints_phi3_lora \
-  --output training/models/phi3-medprof-merged
-```
-
----
-
-## 📊 Evaluation
-
-```bash
-python training/models/model_evaluate.py \
+python3 training/models/model_evaluate.py \
   --model-path training/models/phi3-medprof-merged \
-  --data-path training/data/processed_professor_phi3/tokenized
+  --data-path training/data/processed_professor_phi3_hf
 ```
 
----
+## iOS app (MLX inference)
+1. Open `/Users/louison/Projets/MedicalAssistant/ios_app/MedicalAssistant/MedicalAssistant.xcodeproj`
+2. Ensure your merged + quantized MLX model folder is present in the app bundle:
+   - `/Users/louison/Projets/MedicalAssistant/ios_app/MedicalAssistant/MedicalAssistant/Phi3_Medical_4bit/`
+   - Required files: `model.safetensors`, `config.json`, `generation_config.json`, tokenizer files
+3. Build and run on device
 
-## 📦 CoreML Export
+Notes:
+- History reset button is the top-right `arrow.counterclockwise.circle` icon.
+- The app stores chat history locally (`messages.json`) and clears it from this button.
 
+## Sanity checks
 ```bash
-python model_export/convert_phi3_to_coreml.py \
-  --model-path training/models/phi3-medprof-merged \
-  --output ios_app/MedicalAssistant/MedicalAssistant/MedicalLLM.mlpackage
+python3 tests/test_pytorch.py --model-path training/models/phi3-medprof-merged
+python3 tests/test_model_mlflow.py --model-path training/models/phi3-medprof-merged
+python3 tests/test_tokenizer_assets.py
 ```
 
-Optional: generate a text response with CoreML locally:
-
-```bash
-python model_export/generate_coreml.py --model exports/MedicalLLM_fp16.mlpackage --prompt "Patient: I have chest pain. Doctor:"
-```
-
----
-
-## 📱 iOS App
-
-1) Open `ios_app/MedicalAssistant/MedicalAssistant.xcodeproj` in Xcode
-2) Ensure `MedicalLLM.mlpackage` is included in **Copy Bundle Resources**
-3) Keep `tokenizer.json`, `tokenizer_config.json`, and `generation_config.json` in sync with the merged model
-4) Run on device
-
-The app supports:
-- CPU/GPU toggle
-- Partial streaming output
-- Cancel generation
-- Local chat persistence
-
----
-
-## 🧪 Tests / Sanity Checks
-
-```bash
-python tests/test_pytorch.py --model-path training/models/phi3-medprof-merged
-python tests/test_model_mlflow.py --model-path training/models/phi3-medprof-merged
-```
-
----
-
-## 🔐 Safety & Compliance
-
-- This app is **not medical advice** and should not be used for diagnosis.
-- Always include clear disclaimers in UI and documentation.
+## Safety
+- Not medical advice.
+- Keep explicit emergency disclaimer in UI.
 - Verify dataset licenses before distribution.
-
----
-
-## 👤 Author
-
-**Louison Beranger**  
-AI Engineer & Developer

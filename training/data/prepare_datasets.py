@@ -1,158 +1,151 @@
-"""
-prepare_professor_dataset_phi3.py
----------------------------------
-Crée un dataset “Student–Professor” pour le fine-tuning du modèle Phi-3-mini.
-Sources :
- - MedQA (USMLE)
- - Textbooks médicaux anglais (.txt)
- - MedDialog (anglais)
-"""
-
 import os
-from datasets import load_dataset, concatenate_datasets, Dataset
-from transformers import AutoTokenizer
-from tqdm import tqdm
+import re
+from typing import List
 
-# ==========================================================
-# ⚙️ Configuration
-# ==========================================================
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+# =========================
+# Config
+# =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SAVE_DIR = os.path.join(BASE_DIR, "processed_professor_phi3")
-RAW_DIR = os.path.join(BASE_DIR, "raw")
+DATA_DIR = os.path.join(BASE_DIR, "mlx_data")
+SAVE_DIR = os.path.join(BASE_DIR, "processed_professor_phi3_hf")
 
 TOKENIZER_MODEL = "microsoft/phi-3-mini-4k-instruct"
-MAX_LENGTH = 512
+MAX_LENGTH = 2048
 
+# =========================
+# Setup
+# =========================
+print(f"🚀 Processing MLX JSONL from {DATA_DIR}...")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-print("🚀 Création du dataset Prof–Étudiant pour Phi-3...\n")
-
-# Initialisation du tokenizer
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, use_fast=True)
 if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+    tokenizer.pad_token = tokenizer.eos_token
+    print("ℹ️ Added pad_token = eos_token")
 
-print(f"✅ Tokenizer chargé : {TOKENIZER_MODEL}\n")
+# =========================
+# 1. Load Data
+# =========================
+train_path = os.path.join(DATA_DIR, "train.jsonl")
+valid_path = os.path.join(DATA_DIR, "valid.jsonl")
 
-# ==========================================================
-# 1️⃣ MedQA (USMLE)
-# ==========================================================
-def format_medqa(example):
-    q = example.get("question", "")
-    opts = example.get("options", {})
-    ans = example.get("answer", "")
-    meta = example.get("meta_info", "")
+print(f"📂 Loading {train_path} and {valid_path}...")
+if not os.path.exists(train_path) or not os.path.exists(valid_path):
+    raise FileNotFoundError(f"Missing one of the data files in {DATA_DIR}")
 
-    if isinstance(opts, dict):
-        options_text = "\n".join([f"{k}. {v}" for k, v in opts.items()])
-    else:
-        options_text = str(opts)
+dataset = load_dataset("json", data_files={"train": train_path, "validation": valid_path})
 
-    text = (
-        f"Student: {q}\n"
-        f"Options:\n{options_text}\n"
-        f"Professor: The correct answer is {ans}. "
-        f"Explanation: {meta if meta else 'This involves physiological and pharmacological reasoning.'}"
-    )
-    return {"text": text}
 
-print("📘 Chargement de MedQA (USMLE)...")
-MEDQA_PATH = os.path.join(RAW_DIR, "med_qa/data_clean/data_clean/questions/US/train.jsonl")
-medqa = load_dataset("json", data_files=MEDQA_PATH)["train"].map(format_medqa)
-print(f"✅ MedQA formaté : {len(medqa)} exemples\n")
+# =========================
+# 2. Normalize input format
+# =========================
+def to_phi3_chat(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
 
-# ==========================================================
-# 2️⃣ Textbooks anglais (.txt)
-# ==========================================================
-print("📚 Chargement des textbooks anglais...")
-TEXTBOOK_DIR = os.path.join(RAW_DIR, "med_qa/data_clean/data_clean/textbooks/en")
-text_data = []
+    if "<|user|>" in text and "<|assistant|>" in text:
+        return text
 
-for filename in os.listdir(TEXTBOOK_DIR):
-    if filename.endswith(".txt"):
-        path = os.path.join(TEXTBOOK_DIR, filename)
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read().strip()
-            if len(content) > 200:
-                title = os.path.splitext(filename)[0].replace("_", " ").title()
-                text_data.append({
-                    "text": f"Student: Can you explain the topic of {title}?\nProfessor: {content}"
-                })
+    # Backward compatibility for old samples.
+    student_prof = re.search(r"Student:\s*(.*?)\s*Professor:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    if student_prof:
+        user_content = student_prof.group(1).strip()
+        assistant_content = student_prof.group(2).strip()
+        if user_content and assistant_content:
+            return f"<|user|>\n{user_content}<|end|>\n<|assistant|>\n{assistant_content}<|end|>"
 
-textbooks = Dataset.from_list(text_data)
-print(f"✅ Textbooks formatés : {len(textbooks)} exemples\n")
+    patient_doctor = re.search(r"Patient:\s*(.*?)\s*Doctor:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    if patient_doctor:
+        user_content = patient_doctor.group(1).strip()
+        assistant_content = patient_doctor.group(2).strip()
+        if user_content and assistant_content:
+            return f"<|user|>\n{user_content}<|end|>\n<|assistant|>\n{assistant_content}<|end|>"
 
-# ==========================================================
-# 3️⃣ MedDialog (anglais)
-# ==========================================================
-print("💬 Chargement de MedDialog...")
+    return ""
 
-def format_meddialog(example):
-    desc = example.get("description", "")
-    utts = example.get("utterances", [])
-    dialogue = " ".join(utts).replace("patient:", "student:").replace("doctor:", "professor:")
-    text = f"Case: {desc}\n{dialogue}"
-    return {"text": text}
 
-MEDDIALOG_PATH = os.path.join(BASE_DIR, "processed/english-train.json")
-meddialog = load_dataset("json", data_files=MEDDIALOG_PATH)["train"].map(format_meddialog)
-print(f"✅ MedDialog formaté : {len(meddialog)} exemples\n")
+def format_chat(example):
+    return {"text": to_phi3_chat(example["text"])}
 
-# ==========================================================
-# 4️⃣ Fusion
-# ==========================================================
-print("🧩 Fusion de tous les datasets...")
-combined = concatenate_datasets([medqa, textbooks, meddialog])
-print(f"✅ Total : {len(combined)} exemples combinés\n")
 
-# ==========================================================
-# 5️⃣ Sauvegarde non-tokenisée
-# ==========================================================
-RAW_SAVE_PATH = os.path.join(SAVE_DIR, "raw_text_dataset")
-combined.save_to_disk(RAW_SAVE_PATH)
-print(f"💾 Dataset texte sauvegardé : {RAW_SAVE_PATH}\n")
+print("🧩 Normalizing to Phi-3 chat format...")
+dataset = dataset.map(format_chat)
+dataset = dataset.filter(lambda ex: bool(ex["text"]))
 
-# ==========================================================
-# 6️⃣ Tokenisation
-# ==========================================================
+# =========================
+# 3. Tokenization & assistant-only masking
+# =========================
+assistant_markers: List[List[int]] = []
+for marker in ["<|assistant|>\n", "<|assistant|>"]:
+    marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+    if marker_ids and marker_ids not in assistant_markers:
+        assistant_markers.append(marker_ids)
+
+if not assistant_markers:
+    raise RuntimeError("Could not encode assistant markers with tokenizer.")
+
+
+def find_subsequence(sequence: List[int], pattern: List[int]) -> int:
+    if not pattern or len(pattern) > len(sequence):
+        return -1
+    for idx in range(len(sequence) - len(pattern), -1, -1):
+        if sequence[idx:idx + len(pattern)] == pattern:
+            return idx
+    return -1
+
+
 def tokenize_function(example):
-    tokens = tokenizer(example["text"], truncation=False)
+    tokens = tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=MAX_LENGTH,
+        padding=False,
+        add_special_tokens=False,
+    )
     input_ids = tokens["input_ids"]
-    result_input_ids, result_attention_masks = [], []
+    labels = list(input_ids)
 
-    for i in range(0, len(input_ids), MAX_LENGTH):
-        chunk = input_ids[i:i + MAX_LENGTH]
-        attention_mask = [1] * len(chunk)
+    assistant_start = -1
+    marker_length = 0
+    for marker in assistant_markers:
+        idx = find_subsequence(input_ids, marker)
+        if idx >= 0 and idx >= assistant_start:
+            assistant_start = idx
+            marker_length = len(marker)
 
-        if len(chunk) < MAX_LENGTH:
-            pad_len = MAX_LENGTH - len(chunk)
-            chunk += [tokenizer.pad_token_id] * pad_len
-            attention_mask += [0] * pad_len
+    if assistant_start < 0:
+        labels = [-100] * len(labels)
+    else:
+        content_start = assistant_start + marker_length
+        for i in range(content_start):
+            labels[i] = -100
 
-        result_input_ids.append(chunk)
-        result_attention_masks.append(attention_mask)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": tokens["attention_mask"],
+        "labels": labels,
+    }
 
-    return {"input_ids": result_input_ids, "attention_mask": result_attention_masks}
 
-print("🔠 Tokenisation avec Phi-3 tokenizer...")
-temp_dataset = combined.map(tokenize_function, batched=False, remove_columns=combined.column_names)
+print("🔠 Tokenizing and masking...")
+tokenized_dataset = dataset.map(
+    tokenize_function,
+    batched=False,
+    remove_columns=dataset["train"].column_names,
+)
+tokenized_dataset = tokenized_dataset.filter(lambda ex: any(label != -100 for label in ex["labels"]))
 
-flat_input_ids, flat_attention_masks = [], []
-for ex in temp_dataset:
-    for i in range(len(ex["input_ids"])):
-        flat_input_ids.append(ex["input_ids"][i])
-        flat_attention_masks.append(ex["attention_mask"][i])
-
-tokenized_dataset = Dataset.from_dict({
-    "input_ids": flat_input_ids,
-    "attention_mask": flat_attention_masks
-})
-
-print(f"✅ {len(tokenized_dataset):,} séquences prêtes pour l’entraînement")
-
-# ==========================================================
-# 7️⃣ Sauvegarde finale
-# ==========================================================
-TOKENIZED_PATH = os.path.join(SAVE_DIR, "tokenized")
-tokenized_dataset.save_to_disk(TOKENIZED_PATH)
-print(f"🎉 Dataset tokenisé sauvegardé dans : {TOKENIZED_PATH}\n")
+# =========================
+# 4. Save
+# =========================
+print(f"💾 Saving to {SAVE_DIR}...")
+tokenized_dataset.save_to_disk(SAVE_DIR)
+print(
+    f"✅ Created {len(tokenized_dataset['train'])} train and "
+    f"{len(tokenized_dataset['validation'])} validation samples."
+)
+print(f"🎉 Dataset saved to {SAVE_DIR}")

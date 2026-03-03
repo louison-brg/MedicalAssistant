@@ -35,11 +35,18 @@ final class Tokenizer {
             tokenToId = vocab
             idToToken = Dictionary(uniqueKeysWithValues: vocab.map { ($1, $0) })
             // merges
-            if let merges = model["merges"] as? [String] {
-                bpeRanks.removeAll(keepingCapacity: true)
-                var rank = 0
-                for line in merges {
+            bpeRanks.removeAll(keepingCapacity: true)
+            var rank = 0
+            if let mergesStr = model["merges"] as? [String] {
+                for line in mergesStr {
                     let parts = line.split(separator: " ")
+                    if parts.count == 2 {
+                        bpeRanks["\(parts[0]) \(parts[1])"] = rank
+                        rank += 1
+                    }
+                }
+            } else if let mergesArr = model["merges"] as? [[String]] {
+                for parts in mergesArr {
                     if parts.count == 2 {
                         bpeRanks["\(parts[0]) \(parts[1])"] = rank
                         rank += 1
@@ -128,7 +135,7 @@ final class Tokenizer {
             } else {
                 print("❌ vocab.json n'est pas un dictionnaire [String:Int].")
             }
-            let mergesText = try String(contentsOf: mergesURL)
+            let mergesText = try String(contentsOf: mergesURL, encoding: .utf8)
             var rank = 0
             mergesText.components(separatedBy: .newlines).forEach { line in
                 let line = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -160,10 +167,10 @@ final class Tokenizer {
 
     /// Encode un texte en IDs, sans ajouter BOS/EOS automatiquement.
     /// Utilisez `prependBOS` / `appendEOS` si nécessaire.
-    func encode(_ text: String) -> [Int] {
+    func encode(_ text: String, addPrefixSpace: Bool = true) -> [Int] {
         guard !tokenToId.isEmpty else { return [] }
 
-        let normalized = normalize(text)
+        let normalized = normalize(text, addPrefixSpace: addPrefixSpace)
         let symbols = bpeEncode(word: normalized)
         return symbols.flatMap { tokenIds(forSymbol: $0) }
     }
@@ -216,6 +223,10 @@ final class Tokenizer {
 
     func token(for id: Int) -> String? {
         return idToToken[id]
+    }
+
+    var vocabularySize: Int {
+        tokenToId.count
     }
 
     // Utilitaires pour ajouter des spéciaux
@@ -287,10 +298,10 @@ final class Tokenizer {
         return pairs
     }
 
-    private func normalize(_ text: String) -> String {
+    private func normalize(_ text: String, addPrefixSpace: Bool) -> String {
         // Applique le normalizer HF: prepend '▁' puis remplace les espaces.
         let replaced = text.replacingOccurrences(of: " ", with: "▁")
-        return "▁" + replaced
+        return addPrefixSpace ? ("▁" + replaced) : replaced
     }
 
     private func tokenIds(forSymbol symbol: String) -> [Int] {
