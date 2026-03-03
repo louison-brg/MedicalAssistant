@@ -1,9 +1,13 @@
 import SwiftUI
+import LocalAuthentication
 
 struct ContentView: View {
+    @Environment(\.scenePhase) var scenePhase
     @StateObject private var viewModel: ChatViewModel
     @State private var preferGPU: Bool = true
     @FocusState private var inputFocused: Bool
+    @State private var isUnlocked: Bool = false
+    @State private var showingHistory: Bool = false
 
     init() {
         _viewModel = StateObject(wrappedValue: ChatViewModel())
@@ -14,6 +18,25 @@ struct ContentView: View {
     }
 
     var body: some View {
+        Group {
+            if isUnlocked {
+                mainChatView
+            } else {
+                lockedView
+            }
+        }
+        .onAppear(perform: authenticate)
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background {
+                viewModel.unloadModel()
+                isUnlocked = false
+            } else if newPhase == .active && !isUnlocked {
+                authenticate()
+            }
+        }
+    }
+
+    private var mainChatView: some View {
         VStack(spacing: 0) {
             header
 
@@ -33,6 +56,48 @@ struct ContentView: View {
         }
         .background(backgroundView.ignoresSafeArea())
         .onTapGesture { inputFocused = false }
+    }
+
+    // MARK: - Authentication
+    private func authenticate() {
+        let context = LAContext()
+        var error: NSError?
+
+        if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) {
+            let reason = "Unlock MedLLM to access your medical conversations."
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, authenticationError in
+                DispatchQueue.main.async {
+                    if success {
+                        self.isUnlocked = true
+                    } else {
+                        // Fallback or retry
+                    }
+                }
+            }
+        } else {
+            // No biometrics available, unlock by default or handle passcode
+            self.isUnlocked = true
+        }
+    }
+
+    private var lockedView: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 50))
+                .foregroundColor(ChatTheme.accent)
+            Text("MedLLM is Locked")
+                .font(.title2.bold())
+                .foregroundColor(.white)
+            Button("Unlock") {
+                authenticate()
+            }
+            .padding()
+            .background(ChatTheme.userGradient)
+            .clipShape(Capsule())
+            .foregroundColor(.white)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(backgroundView.ignoresSafeArea())
     }
 
     // MARK: - Background
@@ -85,21 +150,20 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            // Gradient app icon
-            ZStack {
-                Circle()
-                    .fill(ChatTheme.userGradient)
-                    .frame(width: 42, height: 42)
-                    .shadow(color: ChatTheme.accent.opacity(0.4), radius: 8, y: 2)
-                Image(systemName: "brain.head.profile")
-                    .font(.system(size: 19, weight: .semibold))
+            Button {
+                showingHistory = true
+            } label: {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(.white)
             }
+            .padding(.trailing, 4)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("MedLLM")
+                Text(viewModel.sessions.first(where: { $0.id == viewModel.activeSessionId })?.title ?? "MedLLM")
                     .font(ChatTheme.headerTitle)
                     .foregroundStyle(.white)
+                    .lineLimit(1)
                 Text("On-device medical assistant")
                     .font(ChatTheme.headerSubtitle)
                     .foregroundStyle(.white.opacity(0.5))
@@ -111,15 +175,13 @@ struct ContentView: View {
 
             Button {
                 withAnimation(.spring(response: 0.35)) {
-                    viewModel.clearMessages()
+                    viewModel.createNewSession()
                 }
             } label: {
-                Image(systemName: "arrow.counterclockwise.circle")
-                    .font(.system(size: 22, weight: .light))
-                    .foregroundStyle(.white.opacity(0.45))
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(.white)
             }
-            .disabled(viewModel.messages.isEmpty)
-            .opacity(viewModel.messages.isEmpty ? 0.2 : 1)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
@@ -138,6 +200,9 @@ struct ContentView: View {
                 )
                 .ignoresSafeArea(.container, edges: .top)
         )
+        .sheet(isPresented: $showingHistory) {
+            ChatHistoryView(viewModel: viewModel)
+        }
     }
 
     private var gpuToggle: some View {
@@ -237,7 +302,15 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 4) {
                     ForEach(viewModel.messages) { message in
-                        MessageBubble(message: message)
+                        MessageBubble(
+                            message: message,
+                            onEdit: { newText in
+                                viewModel.editMessage(id: message.id, newText: newText)
+                            },
+                            onRegenerate: {
+                                viewModel.regenerate(from: message.id)
+                            }
+                        )
                             .id(message.id)
                     }
                 }
@@ -334,9 +407,9 @@ struct ContentView: View {
             .padding(.vertical, 12)
 
             // Disclaimer
-            Text("⚕️ Not medical advice · For emergencies call local services")
+            Text("⚕️ Not medical advice · 100% Local Inference · Data remains on device")
                 .font(ChatTheme.disclaimerFont)
-                .foregroundStyle(.white.opacity(0.25))
+                .foregroundStyle(.white.opacity(0.35))
                 .padding(.bottom, 6)
         }
         .background(

@@ -25,7 +25,7 @@ from transformers import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a causal LM checkpoint.")
     parser.add_argument("--model-path", default="training/models/phi3-medprof_final_full")
-    parser.add_argument("--data-path", default="training/data/processed_professor_phi3/tokenized")
+    parser.add_argument("--data-path", default="training/data/processed_professor_phi3_hf")
     parser.add_argument("--reports-dir", default="training/reports")
     parser.add_argument("--max-samples", type=int, default=2000)
     parser.add_argument("--max-length", type=int, default=512)

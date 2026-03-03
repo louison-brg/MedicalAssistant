@@ -12,7 +12,7 @@ from datasets import load_from_disk
 # 🔍 Analyse complète du dataset avant fine-tuning
 # ==========================================================
 
-DATA_PATH = "training/data/processed_professor_phi3/tokenized"
+DATA_PATH = "training/data/processed_professor_phi3_hf"
 
 print("📦 Chargement du dataset depuis :", DATA_PATH)
 dataset = load_from_disk(DATA_PATH)

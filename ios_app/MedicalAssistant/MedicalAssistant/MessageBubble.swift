@@ -1,8 +1,15 @@
 import SwiftUI
+import MarkdownUI
 
 struct MessageBubble: View {
     let message: Message
+    var onEdit: ((String) -> Void)? = nil
+    var onRegenerate: (() -> Void)? = nil
+    
     @State private var appeared = false
+    @State private var isEditing = false
+    @State private var editText = ""
+    @FocusState private var isEditFocused: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -23,35 +30,76 @@ struct MessageBubble: View {
 
             VStack(alignment: message.isUser ? .trailing : .leading, spacing: 5) {
                 // Bubble
-                Group {
-                    if !message.isUser && message.isPartial && message.text.isEmpty {
-                        TypingIndicator()
-                    } else {
-                        Text(message.text.isEmpty ? "…" : message.text)
+                if isEditing {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        TextField("Edit message", text: $editText, axis: .vertical)
                             .font(ChatTheme.messageBody)
-                            .textSelection(.enabled)
+                            .foregroundStyle(.black)
+                            .padding(8)
+                            .background(Color.white)
+                            .cornerRadius(8)
+                            .focused($isEditFocused)
+                        
+                        HStack {
+                            Button("Cancel") { isEditing = false }
+                                .font(.caption).foregroundStyle(.white)
+                            Button("Save & Send") {
+                                isEditing = false
+                                if editText != message.text && !editText.isEmpty {
+                                    onEdit?(editText)
+                                }
+                            }
+                            .font(.caption.bold())
+                            .padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(ChatTheme.accent)
+                            .clipShape(Capsule())
+                            .foregroundStyle(.white)
+                        }
                     }
+                    .onAppear { isEditFocused = true }
+                } else {
+                    Group {
+                        if !message.isUser && message.isPartial && message.text.isEmpty {
+                            TypingIndicator()
+                        } else {
+                            Markdown(message.text.isEmpty ? "…" : message.text)
+                                .markdownTheme(.basic)
+                                .font(ChatTheme.messageBody)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(.horizontal, ChatTheme.messagePaddingH)
+                    .padding(.vertical, ChatTheme.messagePaddingV)
+                    .background(bubbleBackground)
+                    .foregroundStyle(message.isUser ? .white : .white.opacity(0.88))
+                    .clipShape(bubbleShape)
+                    .shadow(
+                        color: message.isUser ? ChatTheme.accent.opacity(0.18) : Color.black.opacity(0.2),
+                        radius: message.isUser ? 8 : 4,
+                        y: message.isUser ? 3 : 2
+                    )
+                    .opacity(message.isPartial && !message.text.isEmpty ? 0.8 : 1.0)
                 }
-                .padding(.horizontal, ChatTheme.messagePaddingH)
-                .padding(.vertical, ChatTheme.messagePaddingV)
-                .background(bubbleBackground)
-                .foregroundStyle(message.isUser ? .white : .white.opacity(0.88))
-                .clipShape(bubbleShape)
-                .shadow(
-                    color: message.isUser
-                        ? ChatTheme.accent.opacity(0.18)
-                        : Color.black.opacity(0.2),
-                    radius: message.isUser ? 8 : 4,
-                    y: message.isUser ? 3 : 2
-                )
-                .opacity(message.isPartial && !message.text.isEmpty ? 0.8 : 1.0)
 
-                // Timestamp
-                if !message.isPartial {
-                    Text(relativeTime(message.createdAt))
-                        .font(ChatTheme.messageCaption)
-                        .foregroundStyle(.white.opacity(0.25))
-                        .padding(.horizontal, 4)
+                // Actions & Timestamp
+                if !message.isPartial && !isEditing {
+                    HStack(spacing: 12) {
+                        if message.isUser {
+                            Button(action: {
+                                editText = message.text
+                                isEditing = true
+                            }) { Image(systemName: "pencil").font(.system(size: 12)) }
+                        } else {
+                            Button(action: { onRegenerate?() }) {
+                                Image(systemName: "arrow.clockwise").font(.system(size: 12))
+                            }
+                        }
+                        
+                        Text(relativeTime(message.createdAt))
+                            .font(ChatTheme.messageCaption)
+                    }
+                    .foregroundStyle(.white.opacity(0.35))
+                    .padding(.horizontal, 4)
                 }
             }
 

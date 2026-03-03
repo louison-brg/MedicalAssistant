@@ -11,6 +11,7 @@ training/.DS_Store
 training/data/.DS_Store
 .DS_Store
 training/data/processed_professor_phi3/
+training/data/processed_professor_phi3_hf/
 training/models/phi-3-mini-4k-instruct/
 adapters/
 training/models/phi3-mlx-4bit/
@@ -29,10 +30,18 @@ ios_app/MedicalAssistant/MedicalAssistant/vocab.json
 ios_app/MedicalAssistant/MedicalAssistant/MedicalLLM.mlpackage/
 ios_app/MedicalAssistant/MedicalAssistant/MedicalLLM*.mlpackage/
 ios_app/MedicalAssistant/MedicalAssistant/*.mlmodelc/
+ios_app/MedicalAssistant/MedicalAssistant/Phi3_Medical_4bit/
+ios_app/MedicalAssistant/MedicalAssistant/Phi3_Medical_Latest/
 ios_app/.../
 exports/
 logs/
 models/
+!training/models/
+training/models/*
+!training/models/model_checkpoint.py
+!training/models/model_evaluate.py
+!training/models/model_training.py
+!training/models/model_training_hf.py
 model_export/__pycache__/
 model_export/.coreml_tmp/
 .coreml_tmp/
