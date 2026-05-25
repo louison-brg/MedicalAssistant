@@ -34,6 +34,7 @@ ios_app/MedicalAssistant/MedicalAssistant/Phi3_Medical_4bit/
 ios_app/MedicalAssistant/MedicalAssistant/Phi3_Medical_Latest/
 ios_app/.../
 exports/
+outputs/
 logs/
 models/
 !training/models/
@@ -45,4 +46,5 @@ training/models/*
 model_export/__pycache__/
 model_export/.coreml_tmp/
 .coreml_tmp/
+.codex_spreadsheet_work/
 model_export/phi3-medprof-mlx_weights.npz

@@ -21,7 +21,7 @@ struct ChatHistoryView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(session.title)
                                         .font(.headline)
-                                        .foregroundColor(viewModel.activeSessionId == session.id ? ChatTheme.accent : .primary)
+                                        .foregroundColor(viewModel.activeSessionId == session.id ? ChatTheme.electricBlue : .primary)
                                     
                                     HStack {
                                         Text("\(session.messages.count) messages")
@@ -36,7 +36,7 @@ struct ChatHistoryView: View {
                                 
                                 if viewModel.activeSessionId == session.id {
                                     Image(systemName: "checkmark.circle.fill")
-                                        .foregroundColor(ChatTheme.accent)
+                                        .foregroundColor(ChatTheme.electricBlue)
                                 }
                             }
                             .padding(.vertical, 4)

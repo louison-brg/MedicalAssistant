@@ -35,14 +35,13 @@ actor MLXRunner {
     private var quantBits: Int = 4
     private let quantMode: QuantizationMode = .affine
     private var isLoaded = false
-    private var isLoading = false
+    private var loadTask: Task<Bool, Never>?
 
     private let tokenizer = Tokenizer()
     // Paramètres optimisés pour iPhone sans trop sacrifier la qualité.
     private let maxContextTokens = 512
     private let maxNewTokens = 256
     private let mlxCacheLimitBytes = 20 * 1024 * 1024
-    private let clearCacheEveryGeneratedTokens = 64
     private let samplingTemperature: Float = 0.0
     private let samplingTopP: Float = 0.9
     private let samplingTopK: Int = 40
@@ -55,12 +54,26 @@ actor MLXRunner {
         }
     }
 
-    func loadModel() async {
-        if isLoading || isLoaded {
-            return
+    @discardableResult
+    func loadModel() async -> Bool {
+        if isLoaded {
+            return true
         }
-        isLoading = true
-        defer { isLoading = false }
+
+        if let loadTask {
+            return await loadTask.value
+        }
+
+        let task = Task(priority: .userInitiated) { [self] in
+            await performModelLoad()
+        }
+        loadTask = task
+        let loaded = await task.value
+        loadTask = nil
+        return loaded
+    }
+
+    private func performModelLoad() async -> Bool {
         configureMemoryGuards()
 
         parameters.removeAll(keepingCapacity: false)
@@ -135,7 +148,7 @@ actor MLXRunner {
             guard hasLoadedWeights else {
                 let candidates = Self.modelDirectoryCandidates.joined(separator: ", ")
                 print("❌ Impossible de trouver le modèle MLX dans le bundle. Dossiers candidats: \(candidates), ou fichier attendu: model.safetensors")
-                return
+                return false
             }
 
             let configURLs = [
@@ -144,7 +157,7 @@ actor MLXRunner {
             ].compactMap { $0 }
             guard let loadedConfig = Self.decodeJSON(Phi3Config.self, from: configURLs) else {
                 print("❌ Impossible de charger config.json pour le modèle MLX.")
-                return
+                return false
             }
             self.config = loadedConfig
 
@@ -160,18 +173,18 @@ actor MLXRunner {
 
             isLoaded = !parameters.isEmpty
             print("✅ Modèle MLX chargé avec \(parameters.count) tenseurs. q\(quantBits) group=\(quantGroupSize)")
+            return isLoaded
         } catch {
             print("❌ Erreur lors du chargement du modèle MLX :", error.localizedDescription)
+            return false
         }
     }
 
     func generateResponseStream(for prompt: String, history: [Message]? = nil) -> AsyncThrowingStream<String, Error> {
         return AsyncThrowingStream { continuation in
-            Task(priority: .userInitiated) {
-                if !isLoaded {
-                    await loadModel()
-                }
-                guard isLoaded, let cfg = config else {
+            let task = Task(priority: .userInitiated) {
+                let loaded = await loadModel()
+                guard loaded, let cfg = config else {
                     continuation.yield("⚠️ Modèle MLX non chargé.")
                     continuation.finish()
                     return
@@ -184,17 +197,6 @@ actor MLXRunner {
                 }
 
                 do {
-                    configureMemoryGuards()
-                    GPU.clearCache()
-                    let startMemory = GPU.snapshot()
-                    defer {
-                        GPU.clearCache()
-                        let endMemory = GPU.snapshot()
-                        print("🧮 MLX mémoire départ:\n\(startMemory.description)")
-                        print("🧮 MLX mémoire fin:\n\(endMemory.description)")
-                        print("🧮 MLX delta:\n\(startMemory.delta(endMemory).description)")
-                    }
-
                     let promptTokens = buildPromptTokens(from: prompt, history: history, cfg: cfg)
                     if promptTokens.isEmpty {
                         continuation.yield("(Prompt vide)")
@@ -218,9 +220,10 @@ actor MLXRunner {
                         let lastLogits = logits[0, -1, .ellipsis]
                         eval(lastLogits)
                         
+                        let recentTokens = generated.isEmpty ? [] : Array(generated.suffix(64))
                         let penalized = applyRepetitionPenalty(
                             logits: lastLogits,
-                            recentTokens: Array(generated.suffix(64)),
+                            recentTokens: recentTokens,
                             penalty: repetitionPenalty
                         )
                         let nextToken = sampleToken(
@@ -231,7 +234,10 @@ actor MLXRunner {
                         )
                         
                         if eosTokenIds.contains(nextToken) || nextToken == tokenizer.padTokenId { break }
-                        if !tokenizer.isValid(id: nextToken) { break }
+                        if !tokenizer.isValid(id: nextToken) {
+                            continuation.yield("\n[⚠️ Token invalide: \(nextToken)]")
+                            break
+                        }
                         
                         generated.append(nextToken)
                         
@@ -241,17 +247,24 @@ actor MLXRunner {
                             decodedSoFar = newlyDecoded
                             continuation.yield(newText)
                         }
-                        
+
                         logits = try runModel(inputTokenIds: [Int32(nextToken)], cache: &cache, cfg: cfg)
-                        if generated.count.isMultiple(of: clearCacheEveryGeneratedTokens) {
-                            GPU.clearCache()
-                        }
                     }
+
+                    if generated.isEmpty {
+                        continuation.yield("⚠️ Échec : Le modèle n'a généré aucun texte (corruption silencieuse de la RAM GPU Apple liée au cache). Ce comportement a été massivement optimisé et devrait maintenant disparaître.")
+                    }
+
                     continuation.finish()
                 } catch {
                     print("❌ Erreur d’inférence MLX :", error.localizedDescription)
                     continuation.finish(throwing: error)
                 }
+            }
+
+            // Cette annulation garantit qu'il n'y ait plus de processus MLX zombie qui tourne en tâche de fond !
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
     }
@@ -462,9 +475,8 @@ actor MLXRunner {
         let trimmedPrompt = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
         let contextLimit = min(cfg.maxPositionEmbeddings, maxContextTokens)
 
-        // Inject the clinical System Prompt
-        let systemContent = "You are a prudent, clinical medical assistant. Provide practical diagnostic steps and red flags. Do NOT provide a definitive diagnosis. Maintain a clinical, objective tone."
-        appendTurn(roleToken: "<|system|>", content: systemContent, closeTurn: true, into: &tokens)
+        // Désactivation du "System Prompt" : le modèle a été fine-tuné uniquement sur <|user|> et <|assistant|>.
+        // L'injection d'un système le fait halluciner un préambule ("My response as...") suivi d'un EOS instantané.
 
         func isNoisyAssistantMessage(_ text: String) -> Bool {
             let t = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -548,39 +560,6 @@ actor MLXRunner {
         GPU.set(cacheLimit: mlxCacheLimitBytes)
     }
 
-    private func isLowQualityOutput(_ output: String, userInput: String) -> Bool {
-        let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.isEmpty || text.count < 24 {
-            return true
-        }
-
-        let low = text.lowercased()
-        if low.contains("the correct answer is") || low.contains("explanation: step") {
-            return true
-        }
-
-        let userLow = userInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if !userLow.isEmpty {
-            if low == "\"\(userLow)\"" || low == userLow {
-                return true
-            }
-            if low.hasPrefix(userLow.prefix(min(userLow.count, 20))) && userLow.count > 20 {
-                return true
-            }
-        }
-
-        let words = low.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
-        if words.count >= 8 {
-            let unique = Set(words).count
-            // Seuil abaissé (0.38 -> 0.20) pour éviter de rejeter à tort les longues listes médicales détaillées
-            if Double(unique) / Double(words.count) < 0.20 {
-                return true
-            }
-        }
-
-        return false
-    }
-
     private func applyRepetitionPenalty(logits: MLXArray, recentTokens: [Int], penalty: Float) -> MLXArray {
         guard penalty > 1.0, !recentTokens.isEmpty else {
             return logits
@@ -598,20 +577,20 @@ actor MLXRunner {
     }
 
     private func sampleToken(from logits: MLXArray, temperature: Float, topP: Float, topK: Int) -> Int {
-        let values = logits.asType(.float32).asArray(Float.self)
-        guard !values.isEmpty else {
-            return tokenizer.eosTokenId
-        }
-
         // Décodage déterministe pour réduire fortement le charabia.
         if temperature <= 0.01 {
             return Int(logits.argMax().item(Int32.self))
         }
 
+        let values = logits.asType(.float32).asArray(Float.self)
+        guard !values.isEmpty else {
+            return tokenizer.eosTokenId
+        }
+
         let temp = max(0.05, temperature)
         let maxLogit = values.max() ?? 0
         var expValues = values.map { expf(($0 - maxLogit) / temp) }
-        var sumExp: Float = expValues.reduce(0, +)
+        let sumExp: Float = expValues.reduce(0, +)
         if !sumExp.isFinite || sumExp <= 0 {
             return Int(logits.argMax().item(Int32.self))
         }

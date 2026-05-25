@@ -8,6 +8,8 @@ struct ContentView: View {
     @FocusState private var inputFocused: Bool
     @State private var isUnlocked: Bool = false
     @State private var showingHistory: Bool = false
+    @State private var scrollPosition: UUID?
+    @Namespace private var composerNamespace
 
     init() {
         _viewModel = StateObject(wrappedValue: ChatViewModel())
@@ -34,27 +36,45 @@ struct ContentView: View {
                 authenticate()
             }
         }
+        .onChange(of: viewModel.lastSubmittedUserMessageID) { _, submittedID in
+            guard submittedID != nil else { return }
+            Task {
+                try? await Task.sleep(nanoseconds: 550_000_000)
+                await MainActor.run {
+                    viewModel.clearComposerMorph()
+                }
+            }
+        }
+    }
+
+    private var accentColor: Color {
+        ChatTheme.electricBlue
+    }
+
+    private var accentGradient: LinearGradient {
+        ChatTheme.accentGradient(load: 0)
     }
 
     private var mainChatView: some View {
-        VStack(spacing: 0) {
-            header
+        GlassEffectContainer(spacing: 26) {
+            VStack(spacing: 0) {
+                header
 
-            // Messages or empty state
-            if viewModel.messages.isEmpty {
-                emptyState
-            } else {
-                messageList
+                if viewModel.messages.isEmpty {
+                    emptyState
+                } else {
+                    messageList
+                }
+
+                if let error = viewModel.errorMessage {
+                    errorBanner(error)
+                }
             }
-
-            // Error banner
-            if let error = viewModel.errorMessage {
-                errorBanner(error)
-            }
-
-            inputBar
         }
         .background(backgroundView.ignoresSafeArea())
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            inputBar
+        }
         .onTapGesture { inputFocused = false }
     }
 
@@ -84,7 +104,7 @@ struct ContentView: View {
         VStack(spacing: 20) {
             Image(systemName: "lock.fill")
                 .font(.system(size: 50))
-                .foregroundColor(ChatTheme.accent)
+                .foregroundColor(accentColor)
             Text("MedLLM is Locked")
                 .font(.title2.bold())
                 .foregroundColor(.white)
@@ -92,7 +112,7 @@ struct ContentView: View {
                 authenticate()
             }
             .padding()
-            .background(ChatTheme.userGradient)
+            .background(accentGradient)
             .clipShape(Capsule())
             .foregroundColor(.white)
         }
@@ -104,15 +124,36 @@ struct ContentView: View {
 
     private var backgroundView: some View {
         ZStack {
-            // Base dark color
-            Color(red: 0.06, green: 0.06, blue: 0.10)
+            // Rich MeshGradient for Liquid Glass refraction
+            MeshGradient(
+                width: 3,
+                height: 3,
+                points: [
+                    [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+                    [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
+                    [0.0, 1.0], [0.5, 1.0], [1.0, 1.0]
+                ],
+                colors: [
+                    Color(red: 0.04, green: 0.04, blue: 0.12),  // deep navy
+                    Color(red: 0.06, green: 0.05, blue: 0.16),  // midnight indigo
+                    Color(red: 0.05, green: 0.08, blue: 0.14),  // dark teal-navy
 
-            // Top-left colored blob
+                    Color(red: 0.08, green: 0.06, blue: 0.18),  // deep violet
+                    Color(red: 0.06, green: 0.06, blue: 0.10),  // center base
+                    Color(red: 0.04, green: 0.10, blue: 0.16),  // teal accent
+
+                    Color(red: 0.10, green: 0.08, blue: 0.22),  // violet glow
+                    Color(red: 0.05, green: 0.07, blue: 0.14),  // deep blue
+                    Color(red: 0.06, green: 0.12, blue: 0.18)   // teal edge
+                ]
+            )
+
+            // Scroll-reactive diffuse glow – keeps the glass alive
             Circle()
                 .fill(
                     RadialGradient(
                         colors: [
-                            Color(hue: 0.72, saturation: 0.50, brightness: 0.30),
+                            accentColor.opacity(0.28),
                             Color.clear
                         ],
                         center: .center,
@@ -122,14 +163,13 @@ struct ContentView: View {
                 )
                 .frame(width: 500, height: 500)
                 .offset(x: -150, y: -250)
-                .blur(radius: 80)
+                .blur(radius: 78)
 
-            // Bottom-right colored blob
             Circle()
                 .fill(
                     RadialGradient(
                         colors: [
-                            Color(hue: 0.58, saturation: 0.35, brightness: 0.20),
+                            ChatTheme.deepViolet.opacity(0.18),
                             Color.clear
                         ],
                         center: .center,
@@ -141,8 +181,12 @@ struct ContentView: View {
                 .offset(x: 120, y: 350)
                 .blur(radius: 70)
 
-            // Subtle noise texture overlay
-            Color.white.opacity(0.015)
+            Color.white.opacity(0.012)
+
+            Rectangle()
+                .fill(.ultraThinMaterial.opacity(0.04))
+                .blur(radius: 18)
+                .blendMode(.screen)
         }
     }
 
@@ -184,20 +228,31 @@ struct ContentView: View {
             }
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
         .background(
-            Rectangle()
-                .fill(.ultraThinMaterial.opacity(0.5))
+            UnevenRoundedRectangle(
+                topLeadingRadius: 0,
+                bottomLeadingRadius: 26,
+                bottomTrailingRadius: 26,
+                topTrailingRadius: 0
+            )
+                .fill(.ultraThinMaterial)
                 .overlay(
-                    Rectangle()
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.white.opacity(0.06), Color.clear],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
+                    UnevenRoundedRectangle(
+                        topLeadingRadius: 0,
+                        bottomLeadingRadius: 26,
+                        bottomTrailingRadius: 26,
+                        topTrailingRadius: 0
+                    )
+                    .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
                 )
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(accentColor.opacity(0.18))
+                        .frame(height: 1)
+                        .blur(radius: 3)
+                }
                 .ignoresSafeArea(.container, edges: .top)
         )
         .sheet(isPresented: $showingHistory) {
@@ -221,11 +276,13 @@ struct ContentView: View {
             .padding(.vertical, 6)
             .background(
                 Capsule()
-                    .fill(preferGPU
-                          ? AnyShapeStyle(ChatTheme.userGradient)
-                          : AnyShapeStyle(Color.white.opacity(0.12)))
+                    .fill(preferGPU ? AnyShapeStyle(accentGradient) : AnyShapeStyle(.ultraThinMaterial))
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
+                    )
             )
-            .shadow(color: preferGPU ? ChatTheme.accent.opacity(0.3) : .clear, radius: 6, y: 2)
+            .shadow(color: preferGPU ? accentColor.opacity(0.3) : .clear, radius: 6, y: 2)
         }
         .buttonStyle(.plain)
         .animation(.spring(response: 0.3), value: preferGPU)
@@ -240,13 +297,13 @@ struct ContentView: View {
             // Glowing icon
             ZStack {
                 Circle()
-                    .fill(ChatTheme.accent.opacity(0.1))
+                    .fill(accentColor.opacity(0.12))
                     .frame(width: 100, height: 100)
                     .blur(radius: 20)
 
                 Image(systemName: "stethoscope")
                     .font(.system(size: 46, weight: .light))
-                    .foregroundStyle(ChatTheme.accent.opacity(0.7))
+                    .foregroundStyle(accentColor.opacity(0.8))
             }
 
             Text("How can I help?")
@@ -285,10 +342,10 @@ struct ContentView: View {
                 .padding(.vertical, 10)
                 .background(
                     Capsule()
-                        .fill(Color.white.opacity(0.07))
+                        .fill(.ultraThinMaterial)
                         .overlay(
                             Capsule()
-                                .strokeBorder(Color.white.opacity(0.1), lineWidth: 0.5)
+                                .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
                         )
                 )
         }
@@ -298,34 +355,33 @@ struct ContentView: View {
     // MARK: - Message List
 
     private var messageList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 4) {
-                    ForEach(viewModel.messages) { message in
-                        MessageBubble(
-                            message: message,
-                            onEdit: { newText in
-                                viewModel.editMessage(id: message.id, newText: newText)
-                            },
-                            onRegenerate: {
-                                viewModel.regenerate(from: message.id)
-                            }
-                        )
-                            .id(message.id)
-                    }
-                }
-                .padding(.vertical, 12)
-            }
-            .scrollDismissesKeyboard(.interactively)
-            .onChange(of: viewModel.messages.count) { _, _ in
-                withAnimation(.easeOut(duration: 0.3)) {
-                    proxy.scrollTo(viewModel.messages.last?.id, anchor: .bottom)
+        ScrollView {
+            LazyVStack(spacing: 4) {
+                ForEach(viewModel.messages) { message in
+                    MessageBubble(
+                        message: message,
+                        accentColor: accentColor,
+                        morphNamespace: composerNamespace,
+                        morphFromComposer: message.id == viewModel.lastSubmittedUserMessageID,
+                        onEdit: { newText in
+                            viewModel.editMessage(id: message.id, newText: newText)
+                        },
+                        onRegenerate: {
+                            viewModel.regenerate(from: message.id)
+                        }
+                    )
                 }
             }
-            .onChange(of: viewModel.messages.last?.text) { _, _ in
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo(viewModel.messages.last?.id, anchor: .bottom)
-                }
+            .padding(.vertical, 12)
+            .scrollTargetLayout()
+            .animation(.spring(response: 0.45, dampingFraction: 0.75), value: viewModel.messages.count)
+        }
+        .scrollPosition(id: $scrollPosition, anchor: .bottom)
+        .defaultScrollAnchor(.bottom)
+        .scrollDismissesKeyboard(.interactively)
+        .onChange(of: viewModel.messages.count) { _, _ in
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.75)) {
+                scrollPosition = viewModel.messages.last?.id
             }
         }
     }
@@ -351,85 +407,90 @@ struct ContentView: View {
     // MARK: - Input Bar
 
     private var inputBar: some View {
-        VStack(spacing: 0) {
-            // Subtle top edge line
-            Rectangle()
-                .fill(Color.white.opacity(0.06))
-                .frame(height: 0.5)
-
-            HStack(alignment: .bottom, spacing: 10) {
-                // Text input
+        VStack(spacing: 8) {
+            // The floating pill
+            HStack(alignment: .bottom, spacing: 8) {
                 TextField("Ask a medical question…", text: $viewModel.currentInput, axis: .vertical)
-                    .font(ChatTheme.inputFont)
-                    .foregroundStyle(.white)
+                    .font(.system(size: 16, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.96))
                     .lineLimit(1...5)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .background(
-                        RoundedRectangle(cornerRadius: ChatTheme.inputRadius)
-                            .fill(Color.white.opacity(0.07))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: ChatTheme.inputRadius)
-                                    .strokeBorder(Color.white.opacity(0.1), lineWidth: 0.5)
-                            )
-                    )
                     .focused($inputFocused)
                     .disabled(viewModel.isGenerating)
                     .submitLabel(.send)
-                    .onSubmit { viewModel.sendMessage() }
-                    .tint(ChatTheme.accent)
-
-                // Send / Stop button
-                Button {
-                    if viewModel.isGenerating {
-                        viewModel.cancelGeneration()
-                    } else {
+                    .onSubmit {
                         viewModel.sendMessage()
                         inputFocused = false
                     }
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(buttonFill)
-                            .frame(width: 42, height: 42)
-                            .shadow(color: buttonShadow, radius: 6, y: 2)
+                    .tint(accentColor)
+                    .padding(.vertical, 14)
+                    .padding(.leading, 18)
 
-                        Image(systemName: viewModel.isGenerating ? "stop.fill" : "arrow.up")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                }
-                .disabled(!canSend && !viewModel.isGenerating)
-                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isGenerating)
-                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: canSend)
+                sendButton
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 6)
             }
+            .background(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 26, style: .continuous)
+                            .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 26, style: .continuous)
+                            .strokeBorder(accentColor.opacity(inputFocused ? 0.3 : 0.0), lineWidth: 0.8)
+                    )
+                    .shadow(color: Color.black.opacity(0.18), radius: 14, y: 6)
+            )
             .padding(.horizontal, 14)
-            .padding(.vertical, 12)
 
             // Disclaimer
             Text("⚕️ Not medical advice · 100% Local Inference · Data remains on device")
-                .font(ChatTheme.disclaimerFont)
+                .font(.system(size: 10, weight: .medium, design: .rounded))
                 .foregroundStyle(.white.opacity(0.35))
                 .padding(.bottom, 6)
         }
-        .background(
-            Rectangle()
-                .fill(Color(red: 0.06, green: 0.06, blue: 0.10).opacity(0.9))
+        .padding(.top, 4)
+        // Stable frame for the composer morph
+        .overlay(alignment: .bottomTrailing) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .matchedGeometryEffect(id: "composerMorph", in: composerNamespace, properties: .frame, anchor: .bottomTrailing, isSource: true)
+        }
+    }
+
+    private var sendButton: some View {
+        Button {
+            if viewModel.isGenerating {
+                viewModel.cancelGeneration()
+            } else {
+                viewModel.sendMessage()
+                inputFocused = false
+            }
+        } label: {
+            Circle()
+                .fill(buttonFill)
+                .frame(width: 32, height: 32)
                 .overlay(
-                    Rectangle()
-                        .fill(.ultraThinMaterial.opacity(0.3))
+                    Image(systemName: viewModel.isGenerating ? "stop.fill" : "arrow.up")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
                 )
-                .ignoresSafeArea(.container, edges: .bottom)
-        )
+                .shadow(color: buttonShadow, radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSend && !viewModel.isGenerating)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.isGenerating)
+        .animation(.easeInOut(duration: 0.2), value: canSend)
     }
 
     private var buttonFill: AnyShapeStyle {
         if viewModel.isGenerating {
             return AnyShapeStyle(Color.red.opacity(0.85))
         } else if canSend {
-            return AnyShapeStyle(ChatTheme.userGradient)
+            return AnyShapeStyle(accentGradient)
         } else {
-            return AnyShapeStyle(Color.white.opacity(0.1))
+            return AnyShapeStyle(.ultraThinMaterial)
         }
     }
 
@@ -437,7 +498,7 @@ struct ContentView: View {
         if viewModel.isGenerating {
             return .red.opacity(0.3)
         } else if canSend {
-            return ChatTheme.accent.opacity(0.3)
+            return accentColor.opacity(0.3)
         } else {
             return .clear
         }

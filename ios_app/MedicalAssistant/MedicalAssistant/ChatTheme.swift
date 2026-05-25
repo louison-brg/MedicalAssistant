@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Design Tokens
 
@@ -6,16 +9,12 @@ enum ChatTheme {
 
     // MARK: Colors
 
-    /// Gradient used for user message bubbles.
-    static let userGradient = LinearGradient(
-        colors: [Color(hue: 0.72, saturation: 0.65, brightness: 0.95),   // soft indigo
-                 Color(hue: 0.60, saturation: 0.70, brightness: 0.98)],  // bright blue
-        startPoint: .topLeading,
-        endPoint: .bottomTrailing
-    )
-
-    /// Accent color matching the gradient's primary hue.
-    static let accent = Color(hue: 0.66, saturation: 0.68, brightness: 0.96)
+    static let electricBlue = Color(red: 0 / 255, green: 122 / 255, blue: 255 / 255)
+    static let deepViolet = Color(red: 88 / 255, green: 86 / 255, blue: 214 / 255)
+    static let glassStroke = Color.white.opacity(0.20)
+    static let glassHighlight = Color.white.opacity(0.10)
+    static let backgroundBase = Color(red: 0.06, green: 0.06, blue: 0.10)
+    static let backgroundSecondary = Color(red: 0.10, green: 0.12, blue: 0.20)
 
     /// Surface for AI message cards (adapts to dark/light automatically via Material).
     static let aiCardBackground: some ShapeStyle = .ultraThinMaterial
@@ -34,6 +33,7 @@ enum ChatTheme {
     static let messagePaddingH: CGFloat = 14
     static let messagePaddingV: CGFloat = 10
     static let avatarSize: CGFloat = 28
+    static let glassLineWidth: CGFloat = 0.5
 
     // MARK: Fonts
 
@@ -51,4 +51,49 @@ enum ChatTheme {
     static let bubbleShadow = Color.black.opacity(0.08)
     static let bubbleShadowRadius: CGFloat = 6
     static let bubbleShadowY: CGFloat = 2
+
+    static func accentColor(load: Double) -> Color {
+        #if canImport(UIKit)
+        let progress = min(max(load, 0), 1)
+        return Color(blend(UIColor(electricBlue), with: UIColor(deepViolet), progress: progress))
+        #else
+        return load > 0.5 ? deepViolet : electricBlue
+        #endif
+    }
+
+    static func accentGradient(load: Double) -> LinearGradient {
+        let accent = accentColor(load: load)
+        return LinearGradient(
+            colors: [
+                accent.opacity(0.96),
+                accent.opacity(0.72),
+                deepViolet.opacity(0.82)
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    #if canImport(UIKit)
+    private static func blend(_ from: UIColor, with to: UIColor, progress: Double) -> UIColor {
+        let clampedProgress = CGFloat(min(max(progress, 0), 1))
+        var fromRed: CGFloat = 0
+        var fromGreen: CGFloat = 0
+        var fromBlue: CGFloat = 0
+        var fromAlpha: CGFloat = 0
+        var toRed: CGFloat = 0
+        var toGreen: CGFloat = 0
+        var toBlue: CGFloat = 0
+        var toAlpha: CGFloat = 0
+        from.getRed(&fromRed, green: &fromGreen, blue: &fromBlue, alpha: &fromAlpha)
+        to.getRed(&toRed, green: &toGreen, blue: &toBlue, alpha: &toAlpha)
+
+        return UIColor(
+            red: fromRed + (toRed - fromRed) * clampedProgress,
+            green: fromGreen + (toGreen - fromGreen) * clampedProgress,
+            blue: fromBlue + (toBlue - fromBlue) * clampedProgress,
+            alpha: fromAlpha + (toAlpha - fromAlpha) * clampedProgress
+        )
+    }
+    #endif
 }

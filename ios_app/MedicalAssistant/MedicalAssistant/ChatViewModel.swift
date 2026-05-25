@@ -1,5 +1,4 @@
 import Foundation
-import MLX
 
 /// ViewModel principal du chat médical
 @MainActor
@@ -11,12 +10,22 @@ final class ChatViewModel: ObservableObject {
     @Published var currentInput: String = ""          // Texte saisi par l’utilisateur
     @Published var isGenerating: Bool = false
     @Published var errorMessage: String? = nil
+    @Published private(set) var lastSubmittedUserMessageID: UUID?
 
     // MARK: - Composants internes
-    private lazy var mlx: MLXRunner? = {
-        print("⚙️ Chargement paresseux du modèle MLX…")
-        return MLXRunner()
-    }()
+    private var _mlx: MLXRunner?
+    private var mlx: MLXRunner? {
+        get {
+            if _mlx == nil {
+                print("⚙️ Chargement paresseux du modèle MLX…")
+                _mlx = MLXRunner()
+            }
+            return _mlx
+        }
+        set {
+            _mlx = newValue
+        }
+    }
 
     private let store = MessageStore()
     private var saveTask: Task<Void, Never>?
@@ -36,7 +45,7 @@ final class ChatViewModel: ObservableObject {
         } else {
             // We use Task because loadSessions could theoretically block, but here it's swift
             Task {
-                let loaded = await self.store.loadSessions()
+                let loaded = self.store.loadSessions()
                 self.sessions = loaded
                 if let recent = loaded.sorted(by: { $0.updatedAt > $1.updatedAt }).first {
                     self.activeSessionId = recent.id
@@ -57,6 +66,7 @@ final class ChatViewModel: ObservableObject {
         // Ajoute le message utilisateur
         let userMessage = Message(text: inputText, isUser: true)
         messages.append(userMessage)
+        lastSubmittedUserMessageID = userMessage.id
         let contextMessages = messages
         HapticsHelper.playLightImpact()
         currentInput = ""
@@ -79,6 +89,11 @@ final class ChatViewModel: ObservableObject {
                     let stream = await runner.generateResponseStream(for: inputText, history: contextMessages)
                     for try await chunk in stream {
                         accumulatedResponse += chunk
+                        if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            await MainActor.run {
+                                HapticsHelper.playTokenTick(for: chunk)
+                            }
+                        }
                         await MainActor.run {
                             self.updateMessage(id: assistantId, text: accumulatedResponse, isPartial: true)
                         }
@@ -207,15 +222,16 @@ final class ChatViewModel: ObservableObject {
 
     func setPerformance(preferGPU: Bool) {
         _ = preferGPU
-        print("ℹ️ Réinitialisation du runner MLX.")
-        mlx = MLXRunner()
+        print("ℹ️ Le toggle CPU/GPU est maintenu pour l'UI, mais on ne recharge pas le modèle pour éviter les fuites.")
     }
 
     func unloadModel() {
-        print("🧹 Déchargement du modèle MLX pour libérer la RAM.")
+        print("🧹 Mise en arrière-plan. On maintient le modèle en mémoire : iOS compressera la RAM automatiquement.")
         cancelGeneration()
-        mlx = nil
-        MLX.GPU.clearCache() // Assure que la mémoire GPU est effectivement purgée au niveau MLX
+    }
+
+    func clearComposerMorph() {
+        lastSubmittedUserMessageID = nil
     }
 
     // MARK: - Helpers

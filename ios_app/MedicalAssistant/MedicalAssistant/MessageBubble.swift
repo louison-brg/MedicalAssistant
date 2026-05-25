@@ -3,6 +3,9 @@ import MarkdownUI
 
 struct MessageBubble: View {
     let message: Message
+    let accentColor: Color
+    var morphNamespace: Namespace.ID? = nil
+    var morphFromComposer: Bool = false
     var onEdit: ((String) -> Void)? = nil
     var onRegenerate: (() -> Void)? = nil
     
@@ -19,11 +22,11 @@ struct MessageBubble: View {
             if !message.isUser {
                 ZStack {
                     Circle()
-                        .fill(ChatTheme.accent.opacity(0.15))
+                        .fill(accentColor.opacity(0.15))
                         .frame(width: ChatTheme.avatarSize, height: ChatTheme.avatarSize)
                     Image(systemName: "stethoscope")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(ChatTheme.accent.opacity(0.8))
+                        .foregroundStyle(accentColor.opacity(0.8))
                 }
                 .padding(.top, 4)
             }
@@ -51,34 +54,25 @@ struct MessageBubble: View {
                             }
                             .font(.caption.bold())
                             .padding(.horizontal, 10).padding(.vertical, 4)
-                            .background(ChatTheme.accent)
+                            .background(accentColor)
                             .clipShape(Capsule())
                             .foregroundStyle(.white)
                         }
                     }
                     .onAppear { isEditFocused = true }
                 } else {
-                    Group {
-                        if !message.isUser && message.isPartial && message.text.isEmpty {
-                            TypingIndicator()
-                        } else {
-                            Markdown(message.text.isEmpty ? "…" : message.text)
-                                .markdownTheme(.basic)
-                                .font(ChatTheme.messageBody)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    .padding(.horizontal, ChatTheme.messagePaddingH)
-                    .padding(.vertical, ChatTheme.messagePaddingV)
-                    .background(bubbleBackground)
-                    .foregroundStyle(message.isUser ? .white : .white.opacity(0.88))
-                    .clipShape(bubbleShape)
-                    .shadow(
-                        color: message.isUser ? ChatTheme.accent.opacity(0.18) : Color.black.opacity(0.2),
-                        radius: message.isUser ? 8 : 4,
-                        y: message.isUser ? 3 : 2
-                    )
-                    .opacity(message.isPartial && !message.text.isEmpty ? 0.8 : 1.0)
+                    bubbleContent
+                        .padding(.horizontal, ChatTheme.messagePaddingH)
+                        .padding(.vertical, ChatTheme.messagePaddingV)
+                        .background(bubbleBackground)
+                        .foregroundStyle(.white.opacity(message.isUser ? 0.98 : 0.90))
+                        .clipShape(bubbleShape)
+                        .shadow(
+                            color: message.isUser ? accentColor.opacity(0.18) : Color.black.opacity(0.18),
+                            radius: message.isUser ? 14 : 8,
+                            y: 4
+                        )
+                        .opacity(message.isPartial && !message.text.isEmpty ? 0.82 : 1.0)
                 }
 
                 // Actions & Timestamp
@@ -128,8 +122,14 @@ struct MessageBubble: View {
         .padding(.vertical, 2)
         .opacity(appeared ? 1 : 0)
         .offset(y: appeared ? 0 : 14)
+        .transition(
+            .asymmetric(
+                insertion: .move(edge: .bottom).combined(with: .opacity),
+                removal: .opacity
+            )
+        )
         .onAppear {
-            withAnimation(.spring(response: 0.4, dampingFraction: 0.78)) {
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.75)) {
                 appeared = true
             }
         }
@@ -137,7 +137,7 @@ struct MessageBubble: View {
 
     // MARK: - Bubble Shape
 
-    private var bubbleShape: some Shape {
+    private var bubbleShape: UnevenRoundedRectangle {
         UnevenRoundedRectangle(
             topLeadingRadius: message.isUser ? ChatTheme.bubbleRadius : ChatTheme.bubbleRadiusSmall,
             bottomLeadingRadius: ChatTheme.bubbleRadius,
@@ -146,15 +146,48 @@ struct MessageBubble: View {
         )
     }
 
+    @ViewBuilder
+    private var bubbleContent: some View {
+        if !message.isUser && message.isPartial && message.text.isEmpty {
+            TypingIndicator()
+        } else {
+            Markdown(message.text.isEmpty ? "…" : message.text)
+                .markdownTheme(.basic)
+                .font(ChatTheme.messageBody)
+                .textSelection(.enabled)
+        }
+    }
+
     // MARK: - Bubble Background
 
     @ViewBuilder
     private var bubbleBackground: some View {
-        if message.isUser {
-            ChatTheme.userGradient
+        let baseBubble = bubbleShape
+            .fill(.ultraThinMaterial)
+            .overlay(
+                bubbleShape
+                    .fill(message.isUser ? accentColor.opacity(0.18) : Color.white.opacity(0.05))
+            )
+            .overlay(
+                bubbleShape
+                    .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
+            )
+            .overlay(
+                bubbleShape
+                    .strokeBorder(message.isUser ? accentColor.opacity(0.28) : accentColor.opacity(0.12), lineWidth: 0.75)
+            )
+            .overlay(alignment: .topLeading) {
+                bubbleShape
+                    .strokeBorder(ChatTheme.glassHighlight, lineWidth: 0.35)
+                    .blur(radius: 1.2)
+                    .clipShape(bubbleShape)
+            }
+
+        if morphFromComposer, let morphNamespace {
+            baseBubble
+                .matchedGeometryEffect(id: "composerMorph", in: morphNamespace, properties: .frame, anchor: .bottomTrailing, isSource: false)
         } else {
-            Color.white.opacity(0.08)
-                .background(.ultraThinMaterial.opacity(0.3))
+            baseBubble
         }
     }
 
@@ -176,9 +209,9 @@ struct MessageBubble: View {
     ZStack {
         Color(red: 0.06, green: 0.06, blue: 0.10).ignoresSafeArea()
         VStack(spacing: 12) {
-            MessageBubble(message: Message(text: "I have chest pain since this morning", isUser: true))
-            MessageBubble(message: Message(text: "Could you describe the pain? Is it sharp or dull? Does it radiate to your arm or jaw?", isUser: false))
-            MessageBubble(message: Message(text: "", isUser: false, isPartial: true))
+            MessageBubble(message: Message(text: "I have chest pain since this morning", isUser: true), accentColor: ChatTheme.electricBlue)
+            MessageBubble(message: Message(text: "Could you describe the pain? Is it sharp or dull? Does it radiate to your arm or jaw?", isUser: false), accentColor: ChatTheme.electricBlue)
+            MessageBubble(message: Message(text: "", isUser: false, isPartial: true), accentColor: ChatTheme.electricBlue)
         }
         .padding()
     }

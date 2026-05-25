@@ -1,39 +1,66 @@
 import Foundation
-#if canImport(CoreHaptics)
-import CoreHaptics
+#if canImport(UIKit)
+import UIKit
 #endif
 
+// MARK: - Haptic Feedback Manager with Debouncing
+
+/// Provides debounced haptic feedback to avoid Taptic Engine saturation
+/// during high-frequency token generation.
 enum HapticsHelper {
-    /// Indique si les haptics sont supportés par le matériel.
-    static var isSupported: Bool {
-        #if canImport(CoreHaptics)
-        return CHHapticEngine.capabilitiesForHardware().supportsHaptics
-        #else
-        return false
+    #if canImport(UIKit)
+    private static let heavyGenerator = UIImpactFeedbackGenerator(style: .heavy)
+    private static let mediumGenerator = UIImpactFeedbackGenerator(style: .medium)
+    #endif
+
+    /// Minimum interval between token ticks (~6 per second max).
+    private static let tokenTickInterval: TimeInterval = 0.15
+
+    /// Tracks the last time a token haptic was fired.
+    private static var lastTokenTickDate: Date = .distantPast
+
+    /// Sentence-ending characters that trigger a stronger "thought complete" bump.
+    private static let sentenceEndings: Set<Character> = [".", "!", "?", "\n"]
+
+    // MARK: - Public API
+
+    /// Light impact for discrete user actions (send message, etc.).
+    static func playLightImpact() {
+        #if canImport(UIKit)
+        heavyGenerator.prepare()
+        heavyGenerator.impactOccurred(intensity: 1.0)
         #endif
     }
 
-    /// Joue un feedback simple si supporté, sinon ne fait rien.
-    static func playLightImpact() {
-        #if canImport(CoreHaptics)
-        guard isSupported else { return }
-        do {
-            let engine = try CHHapticEngine()
-            try engine.start()
+    /// Debounced token tick — call this for every chunk during streaming.
+    ///
+    /// - **Time-based debounce**: Ignores calls arriving < 0.15 s after the last tick.
+    /// - **Sentence-end detection**: If `chunk` contains a sentence-ending character
+    ///   (`. ! ? \n`), a slightly stronger `.light` impact fires regardless of debounce,
+    ///   giving a satisfying "thought complete" bump.
+    static func playTokenTick(for chunk: String) {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastTokenTickDate)
 
-            let event = CHHapticEvent(eventType: .hapticTransient,
-                                      parameters: [
-                                          CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.4),
-                                          CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.4)
-                                      ],
-                                      relativeTime: 0)
-            let pattern = try CHHapticPattern(events: [event], parameters: [])
-            let player = try engine.makePlayer(with: pattern)
-            try player.start(atTime: 0)
-            engine.stop(completionHandler: nil)
-        } catch {
-            // Silence les erreurs d'environnement (simulateur, macOS sans Taptic Engine, etc.)
+        // Check for sentence-end — fires a stronger bump immediately
+        let hasSentenceEnd = chunk.contains(where: { sentenceEndings.contains($0) })
+
+        if hasSentenceEnd {
+            lastTokenTickDate = now
+            #if canImport(UIKit)
+            heavyGenerator.prepare()
+            heavyGenerator.impactOccurred(intensity: 0.85)
+            #endif
+            return
         }
+
+        // Time-based debounce for regular token ticks
+        guard elapsed >= tokenTickInterval else { return }
+        lastTokenTickDate = now
+
+        #if canImport(UIKit)
+        mediumGenerator.prepare()
+        mediumGenerator.impactOccurred(intensity: 0.7)
         #endif
     }
 }
