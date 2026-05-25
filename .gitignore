@@ -48,10 +48,3 @@ model_export/.coreml_tmp/
 .coreml_tmp/
 .codex_spreadsheet_work/
 model_export/phi3-medprof-mlx_weights.npz
-
-# Local Google OAuth / service account material
-.google/
-client_secret*.json
-credentials.json
-token.json
-service-account*.json
