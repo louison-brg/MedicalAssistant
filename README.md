@@ -1,214 +1,236 @@
-# MedLLM iOS
+# MedLLM iOS — Private On-Device Medical Assistant
 
-Private medical-assistant prototype running a quantized Phi-3 model entirely on iPhone with SwiftUI and MLX.
+[![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20iOS%2026-blue?logo=apple)](https://developer.apple.com/ios/)
+[![Swift](https://img.shields.io/badge/Swift-5.0%20%7C%20SwiftUI-orange?logo=swift)](https://developer.apple.com/swift/)
+[![MLX](https://img.shields.io/badge/Inference-Apple%20MLX%204--bit-purple)](https://github.com/ml-explore/mlx-swift)
+[![Model](https://img.shields.io/badge/Model-Phi--3%20Mini%20(Fine--Tuned)-emerald)](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
+[![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue?logo=python)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/Tests-Swift%20Testing%20%26%20Pytest-brightgreen)](tests/)
+[![Privacy](https://img.shields.io/badge/Privacy-100%25%20On--Device%20%7C%20Offline-success)](#security--privacy)
 
-> This is an educational prototype, not a medical device or a diagnosis tool. Clinical safety, dataset licensing, bias evaluation, and regulatory review are required before real-world use.
+An end-to-end, privacy-first medical assistant prototype running a specialized **4-bit quantized Phi-3 model** entirely on-device with **SwiftUI** and **Apple MLX**.
 
-## What is in the repository
+From custom LoRA fine-tuning and factual regression benchmarking to zero-network iOS inference, MedLLM is engineered to deliver fast, secure, and accessible medical guidance while strictly adhering to on-device memory limits.
 
-- `ios_app/MedicalAssistant/MedicalAssistant/`: SwiftUI chat, local history, tokenizer, and 4-bit MLX inference.
-- `training/data/`: dataset construction, leakage/quality checks, and optional Hugging Face tokenization.
-- `training/models/`: MLX LoRA training, PEFT fallback, evaluation, checkpoint smoke tests, and model export.
-- `training/reports/`: evaluation outputs and benchmark workbook.
-- `tests/`: fast pipeline and deployment-asset contract tests.
+> **Disclaimer**: This is an educational research prototype, not a certified medical device or diagnostic system. It does not replace professional medical judgment. Before clinical use, regulatory certification (MDR/FDA), dataset licensing compliance, and clinician evaluations are required.
 
-The primary Apple Silicon path is MLX. The Hugging Face/PyTorch scripts are retained as diagnostics and as a PEFT fallback, not as the recommended Mac training route.
+---
 
-## App performance design
+## Architecture Overview
 
-The UI is structured to keep typing independent from inference and chat rendering:
+```
+                                      ┌─────────────────────────────────────────────────────────┐
+                                      │              Python / MLX Training Pipeline              │
+                                      │                                                         │
+[MedQA & Clinical Textbooks] ────────►│  Group-Aware Split  ──►  LoRA Fine-Tuning (MLX-LM)      │
+                                      │                                  │                      │
+                                      │  Asset Contract Tests  ◄──  4-bit Quantization & Export  │
+                                      └──────────────────────────────────┼──────────────────────┘
+                                                                         │ (safetensors + vocab)
+                                                                         ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 iOS / SwiftUI Application Engine                               │
+│                                                                                               │
+│  ┌───────────────────────┐      ┌─────────────────────────┐      ┌─────────────────────────┐  │
+│  │     Swift UI / UX     │◄────►│   Core App & Storage    │◄────►│   MLX Inference Engine  │  │
+│  │                       │      │                         │      │                         │  │
+│  │ • Biometric Lock (LA) │      │ • Actor MessageStore    │      │ • Custom BPE Tokenizer  │  │
+│  │ • Smart Auto-Scroll   │      │ • Complete Protection   │      │ • 4-bit Quantized RoPE  │  │
+│  │ • Offline Voice (TTS) │      │ • Backup Exclusion      │      │ • KV-Cache Optimization │  │
+│  │ • Consultation Export │      │ • Memory Watcher        │      │ • Post-Inference Purge  │  │
+│  │ • Multi-Session Search│      │   (Jetsam Resilience)   │      │   (Metal GPU Cache)     │  │
+│  └───────────────────────┘      └─────────────────────────┘      └─────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-- The composer owns its draft as local SwiftUI state, so a keystroke does not invalidate the message list, Markdown, or mesh background.
-- Stream updates are coalesced to roughly 20 UI refreshes per second.
-- Partial responses use plain `Text`; Markdown is parsed only once the response is complete.
-- Session JSON encoding and protected-file writes run in an actor outside the main actor.
-- Token decoding is incremental rather than repeatedly decoding the full response.
-- Repetition penalty remains on MLX instead of copying the full vocabulary logits to the CPU for every token.
-- The transformer graph is evaluated once per generation step instead of synchronizing Metal after every layer.
+---
 
-Measure on a physical iPhone with Instruments (SwiftUI, Time Profiler, Metal System Trace, and Allocations). Simulator timings are not representative of MLX inference.
+## Key Engineering Highlights
 
-## Environment
+### 1. On-Device LLM Inference & Memory Optimization
+- **Quantized 4-Bit Execution**: Evaluates weights on the Apple Neural Engine and GPU using Apple's MLX Swift library.
+- **Metal Cache Eviction**: Purges temporary activation graphs and intermediate Metal buffers immediately upon generation completion (`GPU.clearCache()`).
+- **Jetsam Resilience**: Handles `UIApplication.didReceiveMemoryWarningNotification` by evicting inference caches or unmapping idle model weights, preventing iOS memory kills.
+- **Single Graph Evaluation**: Batches tensor operations into a single compute graph evaluation per token rather than synchronizing Metal after each transformer layer.
+- **Custom BPE Tokenizer**: Fully native Swift implementation with incremental streaming decoding ($O(n)$ total response decoding instead of quadratic $O(n^2)$ re-parsing) and bounded cache eviction.
 
-Python 3.11 or 3.12 and Apple Silicon are recommended for MLX training. Keep
-the MLX and PEFT fallbacks in separate environments: current MLX-LM uses the
-Transformers 5 family, while the retained PEFT fallback is pinned to the
-Transformers 4 family.
+### 2. High-Performance UI / UX Architecture
+- **Decoupled Keystroke Rendering**: Input composer maintains its text state locally, ensuring individual keystrokes never invalidate the Markdown tree, message list, or ambient mesh background.
+- **Coalesced Token Streaming**: Limits UI redraws to ~20 FPS while synchronizing lightweight tactile haptic feedback (`UIImpactFeedbackGenerator`).
+- **Smart Auto-Scroll**: Tracks user scroll position. If the user scrolls up to review prior answers, incoming tokens will not hijack the viewport; a floating **« Dernier message ↓ »** button lets the user smoothly snap back to the stream.
+- **Interactive Emergency Actions**: Directly connects patients to emergency services (**SAMU 15** and **Europe 112**) via one-tap native URL schemes within the medical disclaimer screen.
+
+### 3. Patient Accessibility & Clinical Workflow
+- **Offline Text-to-Speech (TTS)**: Built-in speech synthesis via `AVSpeechSynthesizer` with Markdown syntax stripping, enabling hands-free access for patients with visual impairment or motor fatigue.
+- **Consultation Export**: Formats complete discussions into clean Markdown / clipboard-ready summaries for physicians and patient records.
+- **Session Search & Management**: Fast in-memory full-text search across conversations, with inline renaming and confirmation dialogs.
+
+---
+
+## Repository Structure
+
+```text
+├── ios_app/
+│   └── MedicalAssistant/
+│       ├── MedicalAssistant/
+│       │   ├── MLXRunner.swift               # 4-bit Phi-3 transformer inference & Metal memory management
+│       │   ├── Tokenizer.swift               # Fast Swift BPE tokenizer with incremental decoding
+│       │   ├── ChatViewModel.swift           # Session coordinator, streaming task, memory warning observer
+│       │   ├── ContentView.swift             # Main SwiftUI interface, biometric gate, floating scroll pill
+│       │   ├── ChatComposer.swift            # Decoupled input bar with character count hints
+│       │   ├── MessageBubble.swift           # Markdown bubbles, TTS voice player, ShareLink, copy actions
+│       │   ├── ChatHistoryView.swift         # Conversation drawer with live search, renaming, swipe actions
+│       │   ├── SpeechSynthesizerManager.swift# On-device speech synthesis with markdown cleanup
+│       │   ├── MedicalDisclaimerView.swift   # Emergency numbers (15 / 112) and legal safety notices
+│       │   ├── MessageStore.swift            # Actor-isolated encrypted JSON persistence
+│       │   ├── Message.swift                 # Data models and structured consultation Markdown export
+│       │   └── Phi3_Medical_Latest/          # Bundled 4-bit quantized safetensors model and vocabulary
+│       └── MedicalAssistantTests/
+│           └── MedicalAssistantTests.swift   # Swift unit tests (storage, tokenizer, speech, sessions)
+├── training/
+│   ├── data/
+│   │   ├── make_mlx_jsonl.py                 # Multi-turn dataset compilation with group-aware splitting
+│   │   ├── check_dataset_quality.py          # Data leakage, repetition, and quality auditing
+│   │   └── prepare_datasets.py               # Hugging Face fallback tokenization
+│   ├── models/
+│   │   ├── model_training.py                 # MLX LoRA training with assistant-only loss masking
+│   │   ├── model_benchmark.py                # Factual evaluation on held-out MedQA benchmarks
+│   │   ├── model_export.py                   # Weight fusion & 4-bit quantization pipeline
+│   │   └── model_checkpoint.py               # Checkpoint validation and integrity smoke tests
+│   └── reports/                              # Retraining and benchmark validation logs
+├── tests/
+│   ├── test_data_pipeline.py                 # Leakage prevention and dataset integrity tests
+│   ├── test_model_assets.py                  # Quantization contract and safetensors tensor tests
+│   └── test_training_pipeline.py             # Config parser and dry-run training pipeline tests
+├── pyproject.toml                            # Pytest and Ruff configuration
+├── requirements-macos.txt                    # Validated Apple Silicon MLX dependencies
+└── requirements.txt                          # Fallback PyTorch / Transformers dependencies
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- **macOS Sonoma** or newer with Apple Silicon (M1/M2/M3/M4)
+- **Xcode 16+** (supports iOS 18+ and iOS 26 deployment targets)
+- **Python 3.11** or **3.12**
+
+### 1. iOS App Setup & Build
+
+1. Open the project in Xcode:
+   ```bash
+   open ios_app/MedicalAssistant/MedicalAssistant.xcodeproj
+   ```
+2. Swift Package Manager will resolve dependencies automatically (`mlx-swift`, `swift-markdown-ui`).
+3. Build and test from the terminal:
+   ```bash
+   # Run Swift unit tests on iPhone Simulator
+   xcodebuild test \
+     -project ios_app/MedicalAssistant/MedicalAssistant.xcodeproj \
+     -scheme MedicalAssistant \
+     -destination "platform=iOS Simulator,name=iPhone 17" \
+     -only-testing:MedicalAssistantTests
+   ```
+4. Deploy to a physical device with adequate memory for the ~2 GB quantized model.
+
+### 2. Python Environment Setup
 
 ```bash
+# Create and activate virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
+
+# Install validated MLX training dependencies
+pip install --upgrade pip
 pip install -r requirements-macos.txt -r requirements-dev.txt
 ```
 
-Only when the legacy PyTorch/PEFT route is needed:
+---
 
-```bash
-python3 -m venv .venv-hf
-source .venv-hf/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt -r requirements-dev.txt
-```
+## Machine Learning Pipeline
 
-`requirements-macos.txt` tracks the validated MLX/MLX-LM release family. Do not mix adapters and base models produced by incompatible conversion versions without re-running the asset tests.
-
-## 1. Build the training dataset
-
-Expected local sources:
-
-- `training/data/raw/med_qa/data_clean/data_clean/questions/US/train.jsonl`
-- `training/data/raw/med_qa/data_clean/data_clean/textbooks/en/*.txt`
-- `training/data/processed/english-train.json` (optional MedDialog source)
-
-Build native chat-format JSONL and audit it:
+### 1. Dataset Preparation & Leakage Audit
+Compiles clinical question-answering pairs and textbook explanations into native chat-format JSONL with **group-aware cross-validation** (preventing passages from the same textbook from appearing in both train and validation sets):
 
 ```bash
 python training/data/make_mlx_jsonl.py
 python training/data/check_dataset_quality.py --data-path training/data/mlx_data
 ```
 
-The output rows use `messages`, not preformatted `text`. This lets MLX-LM apply the tokenizer chat template and mask the prompt from the loss. The split is group-aware: chunks from one textbook or turns from one source dialogue cannot appear in both train and validation.
-
-Textbook responses are capped near the app's 256-token generation budget and
-the source is limited to 15,000 examples by default. MedQA is capped at 2,500
-examples and converted to complete-sentence answers. The source contains only
-answer keys, not rationales, so the prompt never asks the model to imitate a
-justification that is absent from the target data.
-
-To prepare the legacy Hugging Face dataset:
+### 2. MLX LoRA Fine-Tuning
+Fine-tunes adapter layers on Apple Silicon using assistant-only loss masking:
 
 ```bash
-python training/data/prepare_datasets.py \
-  --tokenizer training/models/phi-3-mini-4k-instruct \
-  --overwrite
-python training/data/check_dataset_quality.py \
-  --data-path training/data/processed_professor_phi3_hf
-```
-
-## 2. Train a LoRA adapter with MLX
-
-First inspect the full, effective configuration without starting training:
-
-```bash
+# Dry run to inspect configuration
 python training/models/model_training.py --dry-run
-```
 
-Then train:
-
-```bash
+# Run LoRA training
 python training/models/model_training.py \
   --model-path training/models/phi-3-mini-4k-instruct \
   --data-path training/data/mlx_data \
   --adapter-path training/models/checkpoints_phi3_mlx
 ```
 
-Defaults use assistant-only loss, AdamW, cosine decay with warm-up, gradient checkpointing, gradient accumulation, validation, and the conservative MLX-LM LoRA values (learning rate `1e-5`, rank `8`, direct scale `20`, dropout `0`). MLX's `scale` directly multiplies the LoRA delta; it is not PEFT's `alpha / rank`. Tune the number of adapted layers and iteration count from frozen task benchmarks rather than assuming that a lower training loss means a better medical model.
-
-Resume with:
-
-```bash
-python training/models/model_training.py \
-  --resume-adapter-file training/models/checkpoints_phi3_mlx/adapters.safetensors
-```
-
-## 3. Fuse and quantize for iPhone
-
-MLX-trained adapters must be fused with MLX-LM, not PEFT. The exporter auto-detects MLX versus PEFT adapters and refuses to overwrite an existing model directory.
-
-```bash
-python training/models/model_export.py \
-  --base-model training/models/phi-3-mini-4k-instruct \
-  --adapter training/models/checkpoints_phi3_mlx \
-  --fused-output training/models/phi3-medprof-fused-v2 \
-  --quantized-output training/models/Phi3_Medical_Latest_v2 \
-  --q-bits 4 \
-  --q-group-size 64
-```
-
-The exporter performs the operations in the safe order:
-
-1. Fuse the floating-point LoRA delta into the base model.
-2. Quantize the fused standalone model.
-3. Verify model, tokenizer, and config assets.
-4. Write `export_manifest.json` with source paths, quantization, and tool versions.
-
-For the app, place the verified deployment folder at:
-
-```text
-ios_app/MedicalAssistant/MedicalAssistant/Phi3_Medical_Latest/
-```
-
-Required assets include `model.safetensors`, `config.json`, `generation_config.json`, `tokenizer.json`, and `tokenizer_config.json`.
-
-## 4. Evaluate
-
-Evaluate assistant-only perplexity and deterministic smoke prompts:
-
-```bash
-python training/models/model_evaluate.py \
-  --model-path training/models/phi3-medprof-merged \
-  --data-path training/data/processed_professor_phi3_hf \
-  --disable-mlflow
-```
-
-Perplexity alone is insufficient for a medical assistant. Run the same deterministic held-out MedQA sample against the deployed model and every candidate:
+### 3. Factual Regression Benchmarking
+Prioritizes factual clinical accuracy over artificially rewarded generic emergency referrals on a held-out MedQA dataset:
 
 ```bash
 python training/models/model_benchmark.py \
-  --model training/models/Phi3_Medical_Latest_v2 \
+  --model training/models/Phi3_Medical_Latest \
   --data training/data/mlx_data/valid.jsonl \
   --max-samples 100 \
   --seed 20260805
 ```
 
-This benchmark checks exact answer/option agreement; it is useful for detecting regressions but is not a clinical validation. Add clinician-reviewed rubrics for factuality, uncertainty, contraindications, demographic bias, hallucination rate, refusal behavior, and escalation only when the symptoms actually warrant it.
-
-Do not promote a checkpoint solely because its validation loss improved. A
-candidate must answer diagnosis and treatment questions correctly, avoid
-invented contraindicated advice, express appropriate uncertainty, and escalate
-only when clinically indicated. Keep the deployed model unchanged whenever a
-candidate regresses against the factual baseline.
-
-## 5. Build the iOS app
-
-Open:
-
-```text
-ios_app/MedicalAssistant/MedicalAssistant.xcodeproj
-```
-
-The current project targets iOS 26 and resolves MLX Swift plus MarkdownUI through Swift Package Manager. Xcode may require its optional Metal toolchain:
+### 4. 4-Bit Model Fusion & Quantization
+Safely fuses the LoRA deltas into the base model and quantizes weights for low-memory iOS deployment:
 
 ```bash
-xcodebuild -downloadComponent MetalToolchain
+python training/models/model_export.py \
+  --base-model training/models/phi-3-mini-4k-instruct \
+  --adapter training/models/checkpoints_phi3_mlx \
+  --fused-output training/models/phi3-medprof-fused \
+  --quantized-output ios_app/MedicalAssistant/MedicalAssistant/Phi3_Medical_Latest \
+  --q-bits 4 \
+  --q-group-size 64
 ```
 
-Build from the command line:
+---
+
+## Quality Assurance & Verification
+
+The repository enforces automated contract testing across both Swift and Python:
 
 ```bash
-xcodebuild build \
+# 1. Run Python test suite (13 tests)
+pytest -q
+
+# 2. Run Ruff linter and static compilation check
+ruff check training tests
+python -m compileall -q training tests
+
+# 3. Run Swift unit test suite (8 tests)
+xcodebuild test \
   -project ios_app/MedicalAssistant/MedicalAssistant.xcodeproj \
   -scheme MedicalAssistant \
-  -destination 'generic/platform=iOS' \
-  CODE_SIGNING_ALLOWED=NO
+  -destination "platform=iOS Simulator,name=iPhone 17" \
+  -only-testing:MedicalAssistantTests
 ```
 
-Run on a recent physical iPhone with enough memory for the approximately 2 GB bundled model. The app clears MLX weights when backgrounded and reloads them lazily for the next request.
+---
 
-## Verification
+## Security & Privacy
 
-```bash
-python -m compileall -q training tests
-ruff check training tests
-pytest -q
-```
+- **100% Offline**: Zero remote telemetry, network sockets, or analytics trackers.
+- **Biometric Security**: Conversations are gated behind LocalAuthentication (Face ID / Touch ID / Device Passcode).
+- **At-Rest Encryption**: Files are written with `NSDataWritingOptions.completeFileProtection`.
+- **Backup Exclusion**: Conversation storage files explicitly set `isExcludedFromBackup = true` to prevent unencrypted cloud syncing.
 
-The deployment-asset tests are skipped when the local 4-bit model is absent. When present, they verify quantization metadata, tokenizer stop tokens, and the exact tensor naming contract required by the Swift runner.
+---
 
-## Security and privacy notes
+## Author & Contact
 
-- Conversations are stored in the app container using complete file protection and unlocked with device-owner authentication.
-- Inference is local; the app contains no network client.
-- Deleting the app removes its local conversation container, but device backups and crash diagnostics require a separate deployment policy.
-- Never distribute raw patient data or datasets without an explicit lawful basis, de-identification review, license review, and retention policy.
+**Louison Béranger** — [GitHub](https://github.com/louison-brg)  
+*Machine Learning & iOS Engineer*
