@@ -5,6 +5,10 @@ import Foundation
 /// - Implémente l'encodage BPE et la reconstruction de texte.
 /// - Gère les tokens spéciaux (BOS/EOS/PAD) via détection dans le vocab ou fallback.
 final class Tokenizer {
+    struct DecodingState {
+        fileprivate var byteBuffer: [UInt8] = []
+        fileprivate var isAtStart = true
+    }
     // MARK: - Storage
     private var tokenToId: [String: Int] = [:]
     private var idToToken: [Int: String] = [:]
@@ -88,6 +92,7 @@ final class Tokenizer {
             if let pad = tokenToId["<|pad|>"] ?? tokenToId["<pad>"] ?? tokenToId["<|endoftext|>"] {
                 padTokenId = pad
             }
+            specialTokens.formUnion(["<s>", "</s>", "<|endoftext|>", "<|assistant|>", "<|system|>", "<|user|>", "<|end|>"])
 
             print("✅ Tokenizer(HF) chargé: vocab=\(tokenToId.count), merges=\(bpeRanks.count). BOS=\(bosTokenId), EOS=\(eosTokenId), PAD=\(padTokenId)")
             return true
@@ -213,6 +218,38 @@ final class Tokenizer {
         return result
     }
 
+    /// Incremental decoder used during generation. Unlike decoding the full
+    /// output after each token, this is O(n) for a response rather than O(n²).
+    func decode(_ tokenId: Int, state: inout DecodingState) -> String {
+        guard let token = idToToken[tokenId], !specialTokens.contains(token) else {
+            return ""
+        }
+
+        if let byte = byteTokenValue(token) {
+            state.byteBuffer.append(byte)
+            guard let decoded = String(bytes: state.byteBuffer, encoding: .utf8) else {
+                return ""
+            }
+            state.byteBuffer.removeAll(keepingCapacity: true)
+            return normalizeDecodedPiece(decoded, state: &state)
+        }
+
+        var output = ""
+        if !state.byteBuffer.isEmpty {
+            output = String(decoding: state.byteBuffer, as: UTF8.self)
+            state.byteBuffer.removeAll(keepingCapacity: true)
+        }
+        output += token
+        return normalizeDecodedPiece(output, state: &state)
+    }
+
+    func finishDecoding(state: inout DecodingState) -> String {
+        guard !state.byteBuffer.isEmpty else { return "" }
+        let output = String(decoding: state.byteBuffer, as: UTF8.self)
+        state.byteBuffer.removeAll(keepingCapacity: false)
+        return normalizeDecodedPiece(output, state: &state)
+    }
+
     func id(for token: String) -> Int? {
         return tokenToId[token]
     }
@@ -232,6 +269,11 @@ final class Tokenizer {
     // Utilitaires pour ajouter des spéciaux
     func prependBOS(_ ids: inout [Int]) { ids.insert(bosTokenId, at: 0) }
     func appendEOS(_ ids: inout [Int]) { ids.append(eosTokenId) }
+
+    /// Clears the BPE cache to release heap memory under system pressure.
+    func clearCache() {
+        bpeCache.removeAll(keepingCapacity: false)
+    }
 
     // MARK: - BPE Core
 
@@ -284,6 +326,9 @@ final class Tokenizer {
             pairs = getPairs(symbols)
         }
 
+        if bpeCache.count >= 4_096 {
+            bpeCache.removeAll(keepingCapacity: true)
+        }
         bpeCache[word] = symbols
         return symbols
     }
@@ -334,5 +379,16 @@ final class Tokenizer {
         let end = token.index(before: token.endIndex)
         let hex = String(token[start..<end])
         return UInt8(hex, radix: 16)
+    }
+
+    private func normalizeDecodedPiece(_ piece: String, state: inout DecodingState) -> String {
+        var output = piece.replacingOccurrences(of: "▁", with: " ")
+        if state.isAtStart, output.hasPrefix(" ") {
+            output.removeFirst()
+        }
+        if !output.isEmpty {
+            state.isAtStart = false
+        }
+        return output
     }
 }

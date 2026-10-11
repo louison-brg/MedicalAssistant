@@ -4,11 +4,11 @@ Provides a CLI to keep paths and hyperparams consistent.
 """
 
 import argparse
+import inspect
 import os
-from typing import List, Optional
+from typing import List
 
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1") 
-os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0") 
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 import mlflow
@@ -18,7 +18,6 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    DataCollatorForLanguageModeling,
     set_seed,
 )
 from peft import LoraConfig, get_peft_model
@@ -33,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-split", type=float, default=0.1, help="If dataset is not a dict")
@@ -44,7 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-mlflow", action="store_true")
     parser.add_argument("--mlflow-uri", default="file:./mlruns")
     parser.add_argument("--mlflow-experiment", default="phi3-medical-professor")
-    parser.add_argument("--save-steps", type=int, default=500)
+    parser.add_argument("--save-steps", type=int, default=250)
+    parser.add_argument("--eval-steps", type=int, default=250)
     parser.add_argument("--logging-steps", type=int, default=50)
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--lora-r", type=int, default=8)
@@ -80,13 +80,39 @@ def resolve_device(requested: str) -> tuple[str, torch.dtype, bool]:
 
 
 def detect_lora_targets(model) -> List[str]:
-    targets: List[str] = []
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "dense", "Wqkv", 
-                      "qkv_proj", "gate_up_proj", "down_proj", "up_proj", "gate_proj"]
+    targets: set[str] = set()
+    target_modules = {
+        "q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj",
+        "gate_up_proj", "down_proj", "up_proj", "gate_proj",
+    }
     for name, _ in model.named_modules():
-        if any(x in name for x in target_modules):
-            targets.append(name.split(".")[-1])
-    return sorted(set(targets))
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf in target_modules:
+            targets.add(leaf)
+    return sorted(targets)
+
+
+class AssistantOnlyCollator:
+    """Dynamically pads inputs while preserving precomputed -100 label masks."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features):
+        model_inputs = [
+            {"input_ids": feature["input_ids"], "attention_mask": feature["attention_mask"]}
+            for feature in features
+        ]
+        batch = self.tokenizer.pad(model_inputs, padding=True, return_tensors="pt")
+        padded_length = batch["input_ids"].shape[1]
+        padded_labels = []
+        for feature in features:
+            labels = list(feature["labels"])
+            padding = [-100] * (padded_length - len(labels))
+            labels = padding + labels if self.tokenizer.padding_side == "left" else labels + padding
+            padded_labels.append(labels)
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
+        return batch
 
 
 def main() -> None:
@@ -94,10 +120,6 @@ def main() -> None:
     set_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # MLflow compatibility on macOS
-    import mlflow.utils.autologging_utils
-
-    mlflow.utils.autologging_utils._is_testing = False
     os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
 
     device, dtype, is_mac = resolve_device(args.device)
@@ -129,6 +151,18 @@ def main() -> None:
             eval_dataset = eval_dataset.select(range(min(args.max_eval_samples, len(eval_dataset))))
 
     print(f"✅ Dataset: {len(train_dataset)} train / {len(eval_dataset)} eval")
+
+    def truncate(example):
+        return {
+            key: example[key][: args.max_length]
+            for key in ("input_ids", "attention_mask", "labels")
+            if key in example
+        }
+
+    train_dataset = train_dataset.map(truncate)
+    eval_dataset = eval_dataset.map(truncate)
+    train_dataset = train_dataset.filter(lambda example: any(label != -100 for label in example["labels"]))
+    eval_dataset = eval_dataset.filter(lambda example: any(label != -100 for label in example["labels"]))
 
     # Tokenizer + model
     tokenizer = AutoTokenizer.from_pretrained(
@@ -168,6 +202,7 @@ def main() -> None:
 
     model = get_peft_model(model, lora_config)
     model.to(device)
+    model.enable_input_require_grads()
     model.train()
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -184,40 +219,41 @@ def main() -> None:
         report_to = ["mlflow"]
 
     # Training args
-    training_args = TrainingArguments(
+    training_kwargs = dict(
         output_dir=args.save_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type="cosine",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_strategy="steps",
+        eval_steps=args.eval_steps,
         dataloader_pin_memory=not is_mac,
         report_to=report_to,
         fp16=False,
         bf16=False,
+        gradient_checkpointing=True,
+        max_grad_norm=1.0,
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        label_names=["labels"],
     )
-
-    _base_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-    def data_collator(features):
-        """Wrap base collator to mask padding in labels (set to -100)."""
-        batch = _base_collator(features)
-        if "labels" in batch and tokenizer.pad_token_id is not None:
-            labels = batch["labels"]
-            labels[labels == tokenizer.pad_token_id] = -100
-            batch["labels"] = labels
-        return batch
+    strategy_key = "eval_strategy" if "eval_strategy" in inspect.signature(TrainingArguments).parameters else "evaluation_strategy"
+    training_kwargs[strategy_key] = "steps"
+    training_args = TrainingArguments(**training_kwargs)
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=data_collator,
+        data_collator=AssistantOnlyCollator(tokenizer),
     )
 
     print("🚀 Starting LoRA fine-tuning...")

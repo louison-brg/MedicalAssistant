@@ -34,4 +34,27 @@ struct ChatSession: Identifiable, Codable, Equatable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
+
+    /// Generates clean Markdown export suitable for sharing with a doctor or personal records.
+    func exportText() -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+
+        var export = "# Consultation MedLLM : \(title)\n"
+        export += "Date : \(formatter.string(from: updatedAt))\n"
+        export += "Messages : \(messages.count)\n\n"
+        export += "---\n\n"
+
+        for msg in messages {
+            let role = msg.isUser ? "👤 Question du patient" : "🩺 Réponse MedLLM"
+            let timeStr = formatter.string(from: msg.createdAt)
+            export += "### \(role) (\(timeStr))\n\n"
+            export += "\(msg.text.trimmingCharacters(in: .whitespacesAndNewlines))\n\n"
+        }
+
+        export += "---\n"
+        export += "*Note : Ce document est généré à des fins d'information personnelle via un modèle d'IA local. Il ne remplace en aucun cas une consultation médicale, un diagnostic ou une prescription formelle.*\n"
+        return export
+    }
 }

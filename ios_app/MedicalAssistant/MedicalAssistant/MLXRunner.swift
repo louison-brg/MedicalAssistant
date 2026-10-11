@@ -19,10 +19,21 @@ private struct LayerKVCache {
     var values: MLXArray
 }
 
-private enum MLXRunnerError: Error {
+private enum MLXRunnerError: LocalizedError {
     case missingConfig
     case missingTensor(String)
     case missingRoPE
+
+    var errorDescription: String? {
+        switch self {
+        case .missingConfig:
+            return "Configuration du modèle invalide."
+        case .missingTensor(let name):
+            return "Poids manquant dans le modèle : \(name)"
+        case .missingRoPE:
+            return "Configuration positionnelle RoPE indisponible."
+        }
+    }
 }
 
 /// Runner MLX avec vraie inférence Phi-3 quantifiée (4-bit) en Swift
@@ -45,7 +56,7 @@ actor MLXRunner {
     private let samplingTemperature: Float = 0.0
     private let samplingTopP: Float = 0.9
     private let samplingTopK: Int = 40
-    private let repetitionPenalty: Float = 1.15
+    private let repetitionPenalty: Float = 1.12
     private static let modelDirectoryCandidates = ["Phi3_Medical_Latest"]
 
     init() {
@@ -180,6 +191,24 @@ actor MLXRunner {
         }
     }
 
+    /// Releases the 4-bit weights and MLX's reusable Metal buffers when the app
+    /// enters the background. This lowers the chance of iOS terminating the app
+    /// under memory pressure and guarantees a clean next inference session.
+    func unloadModel() {
+        loadTask?.cancel()
+        loadTask = nil
+        parameters.removeAll(keepingCapacity: false)
+        config = nil
+        rope = nil
+        isLoaded = false
+        GPU.clearCache()
+    }
+
+    /// Explicitly purges intermediate Metal GPU allocations without unloading model weights.
+    func clearInferenceCache() {
+        GPU.clearCache()
+    }
+
     func generateResponseStream(for prompt: String, history: [Message]? = nil) -> AsyncThrowingStream<String, Error> {
         return AsyncThrowingStream { continuation in
             let task = Task(priority: .userInitiated) {
@@ -205,20 +234,21 @@ actor MLXRunner {
                     }
                     
                     var cache = Array<LayerKVCache?>(repeating: nil, count: cfg.numHiddenLayers)
-                    defer { cache.removeAll(keepingCapacity: false) }
+                    defer {
+                        cache.removeAll(keepingCapacity: false)
+                        GPU.clearCache()
+                    }
                     
                     let promptIds = promptTokens.map(Int32.init)
                     var generated: [Int] = []
+                    var decoderState = Tokenizer.DecodingState()
                     
                     // Pré-remplissage
                     var logits = try runModel(inputTokenIds: promptIds, cache: &cache, cfg: cfg)
-                    var decodedSoFar = ""
-                    
                     for _ in 0..<maxNewTokens {
                         if Task.isCancelled { break }
                         
                         let lastLogits = logits[0, -1, .ellipsis]
-                        eval(lastLogits)
                         
                         let recentTokens = generated.isEmpty ? [] : Array(generated.suffix(64))
                         let penalized = applyRepetitionPenalty(
@@ -240,15 +270,17 @@ actor MLXRunner {
                         }
                         
                         generated.append(nextToken)
-                        
-                        let newlyDecoded = tokenizer.decode(generated)
-                        if newlyDecoded.count > decodedSoFar.count {
-                            let newText = String(newlyDecoded.dropFirst(decodedSoFar.count))
-                            decodedSoFar = newlyDecoded
+                        let newText = tokenizer.decode(nextToken, state: &decoderState)
+                        if !newText.isEmpty {
                             continuation.yield(newText)
                         }
 
                         logits = try runModel(inputTokenIds: [Int32(nextToken)], cache: &cache, cfg: cfg)
+                    }
+
+                    let decoderTail = tokenizer.finishDecoding(state: &decoderState)
+                    if !decoderTail.isEmpty {
+                        continuation.yield(decoderTail)
                     }
 
                     if generated.isEmpty {
@@ -318,7 +350,15 @@ actor MLXRunner {
         } else {
             logits = try quantizedLinear(lastHidden, prefix: "lm_head")
         }
-        eval(logits)
+        var arraysToEvaluate = [logits]
+        arraysToEvaluate.reserveCapacity(1 + cache.count * 2)
+        for layerCache in cache.compactMap({ $0 }) {
+            arraysToEvaluate.append(layerCache.keys)
+            arraysToEvaluate.append(layerCache.values)
+        }
+        // One graph evaluation per model step is substantially faster than a
+        // Metal synchronization after every transformer layer.
+        eval(arraysToEvaluate)
         return logits
     }
 
@@ -391,7 +431,6 @@ actor MLXRunner {
 
         var output = attended.transposed(0, 2, 1, 3).reshaped([batch, sequenceLength, cfg.hiddenSize])
         output = try quantizedLinear(output, prefix: "\(layerPrefix).o_proj")
-        eval(keys, values, output)
         return output
     }
 
@@ -451,9 +490,9 @@ actor MLXRunner {
     }
 
     private func buildPromptTokens(from userInput: String, history: [Message]?, cfg: Phi3Config) -> [Int] {
-        // Aligne le format FT et conserve un historique court pour les follow-up.
-        // Format attendu: <|user|>...<|end|><|assistant|>...<|end|> ... <|assistant|>
-        var tokens: [Int] = []
+        // Keep complete chat turns. Raw suffix truncation can start in the middle
+        // of a BPE sequence or silently remove the role token, both of which hurt
+        // answer quality much more than dropping an older turn.
 
         func appendSpecial(_ token: String, into target: inout [Int]) {
             if let id = tokenizer.id(for: token) {
@@ -461,15 +500,37 @@ actor MLXRunner {
             }
         }
 
-        func appendTurn(roleToken: String, content: String, closeTurn: Bool, into target: inout [Int]) {
+        func encodedTurn(roleToken: String, content: String, closeTurn: Bool) -> [Int] {
             let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            appendSpecial(roleToken, into: &target)
-            target += tokenizer.encode("\n" + trimmed, addPrefixSpace: false)
+            guard !trimmed.isEmpty else { return [] }
+            var result: [Int] = []
+            appendSpecial(roleToken, into: &result)
+            result += tokenizer.encode("\n" + trimmed, addPrefixSpace: false)
             if closeTurn {
-                appendSpecial("<|end|>", into: &target)
-                target += tokenizer.encode("\n", addPrefixSpace: false)
+                appendSpecial("<|end|>", into: &result)
+                result += tokenizer.encode("\n", addPrefixSpace: false)
             }
+            return result
+        }
+
+        func clippedUserTurn(_ content: String, limit: Int) -> [Int] {
+            guard limit > 0 else { return [] }
+            var prefix: [Int] = []
+            appendSpecial("<|user|>", into: &prefix)
+            prefix += tokenizer.encode("\n", addPrefixSpace: false)
+            var suffix: [Int] = []
+            appendSpecial("<|end|>", into: &suffix)
+            suffix += tokenizer.encode("\n", addPrefixSpace: false)
+
+            guard prefix.count + suffix.count < limit else {
+                return Array((prefix + suffix).prefix(limit))
+            }
+            let contentTokens = tokenizer.encode(
+                content.trimmingCharacters(in: .whitespacesAndNewlines),
+                addPrefixSpace: false
+            )
+            let contentLimit = limit - prefix.count - suffix.count
+            return prefix + Array(contentTokens.suffix(contentLimit)) + suffix
         }
 
         let trimmedPrompt = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -493,18 +554,18 @@ actor MLXRunner {
             return false
         }
 
+        var turnChunks: [[Int]] = []
         if let history {
             let usable = history.filter { !$0.isPartial && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            // On conserve seulement les 4 derniers tours pour limiter RAM + latence.
-            let recent = Array(usable.suffix(4))
+            let recent = Array(usable.suffix(8))
             for message in recent {
                 if message.isUser {
-                    appendTurn(roleToken: "<|user|>", content: message.text, closeTurn: true, into: &tokens)
+                    turnChunks.append(encodedTurn(roleToken: "<|user|>", content: message.text, closeTurn: true))
                 } else {
                     if isNoisyAssistantMessage(message.text) {
                         continue
                     }
-                    appendTurn(roleToken: "<|assistant|>", content: message.text, closeTurn: true, into: &tokens)
+                    turnChunks.append(encodedTurn(roleToken: "<|assistant|>", content: message.text, closeTurn: true))
                 }
             }
         }
@@ -516,22 +577,33 @@ actor MLXRunner {
             .text
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if normalizedLastUser != trimmedPrompt {
-            appendTurn(roleToken: "<|user|>", content: trimmedPrompt, closeTurn: true, into: &tokens)
+            turnChunks.append(encodedTurn(roleToken: "<|user|>", content: trimmedPrompt, closeTurn: true))
         }
 
-        appendSpecial("<|assistant|>", into: &tokens)
-        tokens += tokenizer.encode("\n", addPrefixSpace: false)
+        var generationPrefix: [Int] = []
+        appendSpecial("<|assistant|>", into: &generationPrefix)
+        generationPrefix += tokenizer.encode("\n", addPrefixSpace: false)
 
-        if tokens.isEmpty {
-            appendTurn(roleToken: "<|user|>", content: trimmedPrompt, closeTurn: true, into: &tokens)
-            appendSpecial("<|assistant|>", into: &tokens)
-            tokens += tokenizer.encode("\n", addPrefixSpace: false)
+        if turnChunks.isEmpty {
+            turnChunks.append(encodedTurn(roleToken: "<|user|>", content: trimmedPrompt, closeTurn: true))
         }
 
-        if tokens.count > contextLimit {
-            tokens = Array(tokens.suffix(contextLimit))
+        var remaining = max(0, contextLimit - generationPrefix.count)
+        var selectedTurns: [[Int]] = []
+        for chunk in turnChunks.reversed() where !chunk.isEmpty {
+            guard chunk.count <= remaining else { continue }
+            selectedTurns.insert(chunk, at: 0)
+            remaining -= chunk.count
         }
-        return tokens
+
+        // The current user turn must always be present, even for unusually long
+        // input. Preserve its role marker and the end marker while clipping text.
+        if selectedTurns.isEmpty {
+            let available = max(0, contextLimit - generationPrefix.count)
+            selectedTurns = [clippedUserTurn(trimmedPrompt, limit: available)]
+        }
+
+        return selectedTurns.flatMap { $0 } + generationPrefix
     }
 
     private func loadGenerationConfig(modelRootURL: URL?) {
@@ -564,16 +636,17 @@ actor MLXRunner {
         guard penalty > 1.0, !recentTokens.isEmpty else {
             return logits
         }
-        var values = logits.asType(.float32).asArray(Float.self)
-        let vocabSize = values.count
-        for token in Set(recentTokens) where token >= 0 && token < vocabSize {
-            if values[token] > 0 {
-                values[token] /= penalty
-            } else {
-                values[token] *= penalty
-            }
-        }
-        return MLXArray(values, [values.count])
+        let uniqueTokens = Set(recentTokens)
+            .filter { $0 >= 0 && $0 < logits.dim(0) }
+            .map(Int32.init)
+        guard !uniqueTokens.isEmpty else { return logits }
+
+        let indices = MLXArray(uniqueTokens)
+        let penalized = logits
+        let selected = penalized[indices]
+        let adjusted = `where`(selected .> 0, selected / penalty, selected * penalty)
+        penalized[indices] = adjusted
+        return penalized
     }
 
     private func sampleToken(from logits: MLXArray, temperature: Float, topP: Float, topK: Int) -> Int {

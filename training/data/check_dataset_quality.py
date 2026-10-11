@@ -1,122 +1,139 @@
-import numpy as np
-import re
-try:
-    import matplotlib.pyplot as plt
-    HAS_PLOT = True
-except Exception:
-    HAS_PLOT = False
+"""Fail-fast quality checks for raw chat JSONL or tokenized HF datasets."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import statistics
 from collections import Counter
-from datasets import load_from_disk
+from pathlib import Path
 
-# ==========================================================
-# 🔍 Analyse complète du dataset avant fine-tuning
-# ==========================================================
 
-DATA_PATH = "training/data/processed_professor_phi3_hf"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Audit training dataset structure and leakage.")
+    parser.add_argument("--data-path", type=Path, default=Path("training/data/mlx_data"))
+    parser.add_argument("--max-duplicate-ratio", type=float, default=0.01)
+    return parser.parse_args()
 
-print("📦 Chargement du dataset depuis :", DATA_PATH)
-dataset = load_from_disk(DATA_PATH)
-print(dataset)
 
-# ==========================================================
-# 🧩 Étape 1 — Structure du dataset
-# ==========================================================
-print("\n📂 Colonnes disponibles :", dataset.column_names)
+def read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON in {path}:{line_number}: {error}") from error
+    return rows
 
-# Affiche un exemple brut
-print("\n🧠 Exemple 0 :")
-print(dataset[0])
 
-# ==========================================================
-# 🧩 Étape 2 — Longueur des séquences
-# ==========================================================
-if "input_ids" in dataset.column_names:
-    lengths = [len(x) for x in dataset["input_ids"]]
-    print("\n📏 Analyse des longueurs de séquence (tokens) :")
-    print(f"   - Nombre total d’exemples : {len(lengths)}")
-    print(f"   - Moyenne : {np.mean(lengths):.1f}")
-    print(f"   - Médiane : {np.median(lengths):.1f}")
-    print(f"   - Maximum : {np.max(lengths)}")
-
-    if HAS_PLOT:
-        plt.hist(lengths, bins=50)
-        plt.title("Distribution de la longueur des séquences")
-        plt.xlabel("Nombre de tokens")
-        plt.ylabel("Fréquence")
-        plt.show()
+def fingerprint(row: dict) -> str:
+    if row.get("messages"):
+        value = "\n".join(str(item.get("content", "")).strip().casefold() for item in row["messages"])
+    elif row.get("input_ids"):
+        value = ",".join(map(str, row["input_ids"]))
     else:
-        print("ℹ️ matplotlib non installé — histogramme ignoré.")
-else:
-    print("\n⚠️ Pas de colonne 'input_ids' — le dataset n’est pas encore tokenisé.")
+        value = str(row.get("text", "")).strip().casefold()
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-empty = []
 
-# ==========================================================
-# 🧩 Étape 3 — Détection d’exemples vides
-# ==========================================================
-if "input_ids" in dataset.column_names:
-    empty = [i for i, ex in enumerate(dataset) if len(ex["input_ids"]) == 0]
-    print(f"⚠️ Exemples vides : {len(empty)}")
-    if len(empty) > 0:
-        print("👉 Conseil : supprimer avec dataset.filter(lambda ex: len(ex['input_ids']) > 0)")
-else:
-    if "text" in dataset.column_names:
-        empty = [i for i, ex in enumerate(dataset) if not ex["text"].strip()]
-        print(f"⚠️ Exemples textuels vides : {len(empty)}")
+def audit_chat_rows(rows: list[dict], split: str) -> tuple[list[str], set[str]]:
+    errors: list[str] = []
+    hashes = set()
+    duplicate_count = 0
+    assistant_lengths = []
+    source_counts = Counter()
 
-# ==========================================================
-# 🧩 Étape 4 — Répartition par type d’exemple (si meta_info)
-# ==========================================================
-if "meta_info" in dataset.column_names:
-    print("\n📊 Répartition des types d’exemples (meta_info) :")
-    counts = Counter(dataset["meta_info"])
-    for k, v in counts.items():
-        print(f"   - {k}: {v}")
-else:
-    print("\nℹ️ Aucune colonne 'meta_info' détectée (pas de catégorisation des exemples).")
+    for index, row in enumerate(rows):
+        messages = row.get("messages")
+        if not isinstance(messages, list) or len(messages) < 2:
+            errors.append(f"{split}[{index}] has no valid messages list")
+            continue
+        roles = [message.get("role") for message in messages]
+        if roles[-1] != "assistant" or "user" not in roles:
+            errors.append(f"{split}[{index}] must contain a user turn and end with assistant")
+        if any(not str(message.get("content", "")).strip() for message in messages):
+            errors.append(f"{split}[{index}] contains empty content")
+        if "<|assistant|>" in json.dumps(messages) or "<|user|>" in json.dumps(messages):
+            errors.append(f"{split}[{index}] contains preformatted control tokens")
 
-# ==========================================================
-# 🧩 Étape 5 — Vérification du format de prompt
-# ==========================================================
-def is_medical_prompt(text):
-    return bool(re.search(r'(Patient|Question|Textbook|Doctor|Answer)', text))
+        assistant_lengths.append(len(str(messages[-1].get("content", ""))))
+        source_counts[str(row.get("source", "unknown"))] += 1
+        digest = fingerprint(row)
+        if digest in hashes:
+            duplicate_count += 1
+        hashes.add(digest)
 
-if "text" in dataset.column_names:
-    valid_ratio = sum(is_medical_prompt(t) for t in dataset["text"]) / len(dataset)
-    print(f"\n✅ {valid_ratio*100:.1f}% des exemples ont un format de prompt valide.")
-    if valid_ratio < 0.8:
-        print("⚠️ Peu d’exemples contiennent un format clair (Patient:, Question:, etc.)")
-else:
-    print("\n⚠️ Impossible de vérifier les prompts — dataset déjà tokenisé.")
+    ratio = duplicate_count / max(1, len(rows))
+    print(f"{split}: {len(rows):,} rows, {duplicate_count:,} duplicates ({ratio:.2%})")
+    if assistant_lengths:
+        sorted_lengths = sorted(assistant_lengths)
+        p95 = sorted_lengths[min(len(sorted_lengths) - 1, int(len(sorted_lengths) * 0.95))]
+        print(
+            f"  assistant chars: median={statistics.median(assistant_lengths):.0f}, "
+            f"p95={p95:,}, max={max(assistant_lengths):,}"
+        )
+    print("  sources:", ", ".join(f"{name}={count:,}" for name, count in sorted(source_counts.items())))
+    return errors, hashes
 
-# ==========================================================
-# 🧩 Étape 6 — Vérification du vocabulaire médical
-# ==========================================================
-medical_terms = ["heart", "lung", "infection", "tumor", "diabetes", "fever", "hypertension", "CT", "MRI"]
-if "text" in dataset.column_names:
-    ratio = sum(any(term in t.lower() for term in medical_terms) for t in dataset["text"]) / len(dataset)
-    print(f"🩺 {ratio*100:.1f}% des exemples contiennent du vocabulaire médical.")
-    if ratio < 0.4:
-        print("⚠️ Le corpus semble peu médical — attention à la pertinence du fine-tuning.")
-else:
-    print("ℹ️ Dataset tokenisé — vocabulaire non vérifiable directement.")
 
-# ==========================================================
-# 🧩 Étape 7 — Rapport final
-# ==========================================================
-print("\n==================== 📋 RAPPORT FINAL ====================")
+def audit_tokenized(path: Path) -> int:
+    from datasets import DatasetDict, load_from_disk
 
-if "input_ids" in dataset.column_names:
-    print(f"📈 Moyenne de longueur : {np.mean(lengths):.0f} tokens")
-    print(f"📉 Médiane : {np.median(lengths):.0f}")
-    print(f"📏 Max : {np.max(lengths)}")
-    if np.max(lengths) > 1024:
-        print("⚠️ Certaines séquences dépassent 1024 tokens (seront tronquées).")
+    dataset = load_from_disk(path)
+    splits = dataset if isinstance(dataset, DatasetDict) else {"data": dataset}
+    failures = []
+    for name, split in splits.items():
+        lengths = [len(row["input_ids"]) for row in split]
+        supervised = [sum(label != -100 for label in row.get("labels", [])) for row in split]
+        if not lengths or any(length == 0 for length in lengths):
+            failures.append(f"{name} contains empty token sequences")
+        if any(count == 0 for count in supervised):
+            failures.append(f"{name} contains examples without assistant labels")
+        print(
+            f"{name}: {len(split):,} rows, median={statistics.median(lengths):.0f} tokens, "
+            f"max={max(lengths):,}, median supervised={statistics.median(supervised):.0f}"
+        )
+    if failures:
+        print("FAILED")
+        for failure in failures:
+            print(" -", failure)
+        return 1
+    print("Dataset checks passed")
+    return 0
 
-if len(empty) > 0:
-    print(f"⚠️ {len(empty)} exemples vides détectés → à filtrer avant entraînement.")
 
-if "meta_info" in dataset.column_names:
-    print("📊 Types d’exemples présents :", list(Counter(dataset["meta_info"]).keys()))
+def main() -> int:
+    args = parse_args()
+    if (args.data_path / "train.jsonl").exists():
+        train = read_jsonl(args.data_path / "train.jsonl")
+        valid = read_jsonl(args.data_path / "valid.jsonl")
+        train_errors, train_hashes = audit_chat_rows(train, "train")
+        valid_errors, valid_hashes = audit_chat_rows(valid, "valid")
+        overlap = train_hashes & valid_hashes
+        duplicate_ratio = (len(train) - len(train_hashes) + len(valid) - len(valid_hashes)) / max(
+            1, len(train) + len(valid)
+        )
+        failures = train_errors + valid_errors
+        if overlap:
+            failures.append(f"train/validation leakage: {len(overlap)} identical examples")
+        if duplicate_ratio > args.max_duplicate_ratio:
+            failures.append(
+                f"duplicate ratio {duplicate_ratio:.2%} exceeds {args.max_duplicate_ratio:.2%}"
+            )
+        if failures:
+            print(f"FAILED with {len(failures)} issue(s)")
+            for failure in failures[:25]:
+                print(" -", failure)
+            return 1
+        print("Dataset checks passed")
+        return 0
 
-print("\n✅ Vérification terminée.")
+    if args.data_path.exists():
+        return audit_tokenized(args.data_path)
+    raise FileNotFoundError(f"Dataset not found: {args.data_path}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

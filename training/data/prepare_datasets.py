@@ -1,151 +1,135 @@
-import os
+"""Create a Hugging Face dataset with assistant-only causal-LM labels."""
+
+from __future__ import annotations
+
+import argparse
 import re
-from typing import List
+import shutil
+from pathlib import Path
+from typing import Optional
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-# =========================
-# Config
-# =========================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "mlx_data")
-SAVE_DIR = os.path.join(BASE_DIR, "processed_professor_phi3_hf")
-
-TOKENIZER_MODEL = "microsoft/phi-3-mini-4k-instruct"
-MAX_LENGTH = 2048
-
-# =========================
-# Setup
-# =========================
-print(f"🚀 Processing MLX JSONL from {DATA_DIR}...")
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, use_fast=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    print("ℹ️ Added pad_token = eos_token")
-
-# =========================
-# 1. Load Data
-# =========================
-train_path = os.path.join(DATA_DIR, "train.jsonl")
-valid_path = os.path.join(DATA_DIR, "valid.jsonl")
-
-print(f"📂 Loading {train_path} and {valid_path}...")
-if not os.path.exists(train_path) or not os.path.exists(valid_path):
-    raise FileNotFoundError(f"Missing one of the data files in {DATA_DIR}")
-
-dataset = load_dataset("json", data_files={"train": train_path, "validation": valid_path})
+BASE_DIR = Path(__file__).resolve().parent
+DATASET_CACHE = BASE_DIR / ".dataset_cache"
 
 
-# =========================
-# 2. Normalize input format
-# =========================
-def to_phi3_chat(text: str) -> str:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Tokenize chat JSONL for the legacy HF trainer.")
+    parser.add_argument("--data-dir", type=Path, default=BASE_DIR / "mlx_data")
+    parser.add_argument("--output", type=Path, default=BASE_DIR / "processed_professor_phi3_hf")
+    parser.add_argument("--tokenizer", default="training/models/phi-3-mini-4k-instruct")
+    parser.add_argument("--max-length", type=int, default=2_048)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args()
+
+
+def legacy_text_to_messages(text: str) -> Optional[list[dict[str, str]]]:
     text = (text or "").strip()
     if not text:
-        return ""
+        return None
 
-    if "<|user|>" in text and "<|assistant|>" in text:
-        return text
-
-    # Backward compatibility for old samples.
-    student_prof = re.search(r"Student:\s*(.*?)\s*Professor:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
-    if student_prof:
-        user_content = student_prof.group(1).strip()
-        assistant_content = student_prof.group(2).strip()
-        if user_content and assistant_content:
-            return f"<|user|>\n{user_content}<|end|>\n<|assistant|>\n{assistant_content}<|end|>"
-
-    patient_doctor = re.search(r"Patient:\s*(.*?)\s*Doctor:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
-    if patient_doctor:
-        user_content = patient_doctor.group(1).strip()
-        assistant_content = patient_doctor.group(2).strip()
-        if user_content and assistant_content:
-            return f"<|user|>\n{user_content}<|end|>\n<|assistant|>\n{assistant_content}<|end|>"
-
-    return ""
-
-
-def format_chat(example):
-    return {"text": to_phi3_chat(example["text"])}
-
-
-print("🧩 Normalizing to Phi-3 chat format...")
-dataset = dataset.map(format_chat)
-dataset = dataset.filter(lambda ex: bool(ex["text"]))
-
-# =========================
-# 3. Tokenization & assistant-only masking
-# =========================
-assistant_markers: List[List[int]] = []
-for marker in ["<|assistant|>\n", "<|assistant|>"]:
-    marker_ids = tokenizer.encode(marker, add_special_tokens=False)
-    if marker_ids and marker_ids not in assistant_markers:
-        assistant_markers.append(marker_ids)
-
-if not assistant_markers:
-    raise RuntimeError("Could not encode assistant markers with tokenizer.")
-
-
-def find_subsequence(sequence: List[int], pattern: List[int]) -> int:
-    if not pattern or len(pattern) > len(sequence):
-        return -1
-    for idx in range(len(sequence) - len(pattern), -1, -1):
-        if sequence[idx:idx + len(pattern)] == pattern:
-            return idx
-    return -1
-
-
-def tokenize_function(example):
-    tokens = tokenizer(
-        example["text"],
-        truncation=True,
-        max_length=MAX_LENGTH,
-        padding=False,
-        add_special_tokens=False,
+    phi3 = re.search(
+        r"<\|user\|>\s*(.*?)\s*<\|end\|>\s*<\|assistant\|>\s*(.*?)\s*<\|end\|>",
+        text,
+        re.DOTALL,
     )
-    input_ids = tokens["input_ids"]
-    labels = list(input_ids)
+    if phi3:
+        return [
+            {"role": "user", "content": phi3.group(1).strip()},
+            {"role": "assistant", "content": phi3.group(2).strip()},
+        ]
 
-    assistant_start = -1
-    marker_length = 0
-    for marker in assistant_markers:
-        idx = find_subsequence(input_ids, marker)
-        if idx >= 0 and idx >= assistant_start:
-            assistant_start = idx
-            marker_length = len(marker)
+    for pattern in (
+        r"Student:\s*(.*?)\s*Professor:\s*(.*)",
+        r"Patient:\s*(.*?)\s*Doctor:\s*(.*)",
+    ):
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            return [
+                {"role": "user", "content": match.group(1).strip()},
+                {"role": "assistant", "content": match.group(2).strip()},
+            ]
+    return None
 
-    if assistant_start < 0:
-        labels = [-100] * len(labels)
-    else:
-        content_start = assistant_start + marker_length
-        for i in range(content_start):
-            labels[i] = -100
 
+def normalize_messages(example: dict) -> dict:
+    messages = example.get("messages")
+    if not messages:
+        messages = legacy_text_to_messages(example.get("text", ""))
+    if not messages or len(messages) < 2:
+        return {"messages": []}
+
+    normalized = []
+    for message in messages:
+        role = str(message.get("role", "")).strip().lower()
+        content = str(message.get("content", "")).strip()
+        if role in {"system", "user", "assistant"} and content:
+            normalized.append({"role": role, "content": content})
+    if not normalized or normalized[-1]["role"] != "assistant":
+        return {"messages": []}
+    return {"messages": normalized}
+
+
+def tokenize_chat(example: dict, tokenizer, max_length: int) -> dict:
+    messages = example["messages"]
+    full_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+    prompt_ids = tokenizer.apply_chat_template(
+        messages[:-1],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+
+    full_ids = full_ids[:max_length]
+    prompt_length = min(len(prompt_ids), len(full_ids))
+    labels = [-100] * prompt_length + list(full_ids[prompt_length:])
     return {
-        "input_ids": input_ids,
-        "attention_mask": tokens["attention_mask"],
+        "input_ids": list(full_ids),
+        "attention_mask": [1] * len(full_ids),
         "labels": labels,
     }
 
 
-print("🔠 Tokenizing and masking...")
-tokenized_dataset = dataset.map(
-    tokenize_function,
-    batched=False,
-    remove_columns=dataset["train"].column_names,
-)
-tokenized_dataset = tokenized_dataset.filter(lambda ex: any(label != -100 for label in ex["labels"]))
+def main() -> int:
+    args = parse_args()
+    train_path = args.data_dir / "train.jsonl"
+    valid_path = args.data_dir / "valid.jsonl"
+    if not train_path.exists() or not valid_path.exists():
+        raise FileNotFoundError(f"Expected train.jsonl and valid.jsonl in {args.data_dir}")
+    if args.output.exists():
+        if not args.overwrite:
+            raise FileExistsError(f"Output already exists: {args.output}. Pass --overwrite to replace it.")
+        shutil.rmtree(args.output)
 
-# =========================
-# 4. Save
-# =========================
-print(f"💾 Saving to {SAVE_DIR}...")
-tokenized_dataset.save_to_disk(SAVE_DIR)
-print(
-    f"✅ Created {len(tokenized_dataset['train'])} train and "
-    f"{len(tokenized_dataset['validation'])} validation samples."
-)
-print(f"🎉 Dataset saved to {SAVE_DIR}")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dataset = load_dataset(
+        "json",
+        data_files={"train": str(train_path), "validation": str(valid_path)},
+        cache_dir=str(DATASET_CACHE),
+    )
+    dataset = dataset.map(normalize_messages)
+    dataset = dataset.filter(lambda example: bool(example["messages"]))
+    original_columns = dataset["train"].column_names
+    tokenized = dataset.map(
+        lambda example: tokenize_chat(example, tokenizer, args.max_length),
+        remove_columns=original_columns,
+    )
+    tokenized = tokenized.filter(lambda example: any(label != -100 for label in example["labels"]))
+    tokenized.save_to_disk(args.output)
+    print(
+        f"Saved {len(tokenized['train']):,} train and "
+        f"{len(tokenized['validation']):,} validation samples to {args.output}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

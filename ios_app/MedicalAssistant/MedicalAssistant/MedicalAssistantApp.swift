@@ -11,7 +11,7 @@ import SwiftUI
 struct MedicalAssistantApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            LaunchGateView()
         }
     }
 }

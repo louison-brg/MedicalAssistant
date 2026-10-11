@@ -1,7 +1,8 @@
 import Foundation
 
-@MainActor
-final class MessageStore {
+/// File-backed session storage. Actor isolation keeps JSON encoding and disk I/O
+/// off the main actor so saving a long conversation never blocks the keyboard.
+actor MessageStore {
     private let fileName = "sessions.json"
     private let legacyFileName = "messages.json"
 
@@ -21,7 +22,7 @@ final class MessageStore {
                     updatedAt: oldMessages.last?.createdAt ?? Date()
                 )
                 
-                // Save it to the new format right away
+                // Save it to the new format right away.
                 saveSessions([migratedSession])
                 
                 // Remove legacy file
@@ -37,6 +38,10 @@ final class MessageStore {
         guard let url = fileURL(for: fileName), FileManager.default.fileExists(atPath: url.path) else {
             return []
         }
+
+        // Keep conversation files out of device/cloud backups so the privacy
+        // promise remains true beyond the app's own lack of network access.
+        try? excludeFromBackup(url)
         
         do {
             let data = try Data(contentsOf: url)
@@ -54,9 +59,9 @@ final class MessageStore {
         do {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.prettyPrinted]
             let data = try encoder.encode(sessions)
             try data.write(to: url, options: [.atomic, .completeFileProtection])
+            try excludeFromBackup(url)
         } catch {
             print("⚠️ Failed to save sessions: \(error.localizedDescription)")
         }
@@ -69,5 +74,12 @@ final class MessageStore {
 
     private func fileURL(for name: String) -> URL? {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent(name)
+    }
+
+    private func excludeFromBackup(_ url: URL) throws {
+        var protectedURL = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try protectedURL.setResourceValues(values)
     }
 }

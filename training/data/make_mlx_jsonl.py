@@ -1,24 +1,37 @@
+"""Build leakage-resistant chat JSONL files for MLX LoRA training.
+
+The output uses mlx-lm's native ``messages`` format. This is important: prompt
+masking is not supported for preformatted ``text`` examples, so the older
+pipeline inadvertently trained on both user and assistant tokens.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
+import random
 import re
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import load_dataset
 
-# ==========================================================
-# ⚙️ Configuration
-# ==========================================================
 BASE_DIR = Path(__file__).resolve().parent
-RAW_DIR = BASE_DIR / "raw"
-OUT_DIR = BASE_DIR / "mlx_data"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-print("🚀 Préparation du dataset médical pour MLX (format Phi-3 chat)...\n")
+DATASET_CACHE = BASE_DIR / ".dataset_cache"
 
 
-def format_phi3(user_text: str, assistant_text: str) -> str:
-    """Encapsule le dialogue dans le format attendu par Phi-3 Instruct."""
-    return f"<|user|>\n{user_text}<|end|>\n<|assistant|>\n{assistant_text}<|end|>"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prepare medical chat data for mlx-lm.")
+    parser.add_argument("--raw-dir", type=Path, default=BASE_DIR / "raw")
+    parser.add_argument("--meddialog-path", type=Path, default=BASE_DIR / "processed/english-train.json")
+    parser.add_argument("--out-dir", type=Path, default=BASE_DIR / "mlx_data")
+    parser.add_argument("--validation-ratio", type=float, default=0.1)
+    parser.add_argument("--max-medqa-examples", type=int, default=2_500)
+    parser.add_argument("--max-textbook-examples", type=int, default=15_000)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
 
 
 def clean_text(text: Optional[str]) -> str:
@@ -34,106 +47,106 @@ def clean_text(text: Optional[str]) -> str:
 
 
 def looks_noisy(text: str) -> bool:
-    lowered = text.lower()
+    lowered = text.lower().strip()
     if not lowered:
         return True
-    if "the correct answer is" in lowered or "explanation: step" in lowered:
-        return True
-    if "this is a riddle" in lowered:
+    banned_fragments = (
+        "the correct answer is",
+        "explanation: step",
+        "this is a riddle",
+    )
+    if any(fragment in lowered for fragment in banned_fragments):
         return True
     words = re.findall(r"[a-zA-ZÀ-ÿ']+", lowered)
-    if len(words) >= 12:
-        unique_ratio = len(set(words)) / len(words)
-        if unique_ratio < 0.34:
-            return True
-    return False
+    return len(words) >= 12 and len(set(words)) / len(words) < 0.34
 
 
-def format_medqa(example: dict) -> dict:
+def chat_example(user: str, assistant: str, *, source: str, group_id: str) -> dict:
+    return {
+        "messages": [
+            {"role": "user", "content": clean_text(user)},
+            {"role": "assistant", "content": clean_text(assistant)},
+        ],
+        "source": source,
+        "group_id": group_id,
+    }
+
+
+def format_medqa(example: dict, index: int) -> Optional[dict]:
     question = clean_text(example.get("question"))
     answer = clean_text(example.get("answer"))
     options = example.get("options")
+    if not question or not answer or looks_noisy(answer):
+        return None
 
-    if not question or not answer:
-        return {"text": ""}
-
-    option_lines: List[str] = []
+    option_lines = []
     if isinstance(options, dict):
-        for key in sorted(options):
-            value = clean_text(options[key])
-            if value:
-                option_lines.append(f"{key}. {value}")
+        values = ((str(key), options[key]) for key in sorted(options))
     elif isinstance(options, list):
-        for i, value in enumerate(options, start=1):
-            text = clean_text(value)
-            if text:
-                option_lines.append(f"{i}. {text}")
+        values = ((str(i), value) for i, value in enumerate(options, start=1))
+    else:
+        values = ()
+    for key, value in values:
+        cleaned = clean_text(value)
+        if cleaned:
+            option_lines.append(f"{key}. {cleaned}")
 
-    user_parts = [
-        "A medical exam question was asked. Provide the best clinical answer.",
-        question,
-    ]
+    user_parts = ["Choose the single best answer for this medical exam question.", question]
     if option_lines:
         user_parts.append("Options:\n" + "\n".join(option_lines))
+    answer = (
+        f"The most appropriate choice is {answer}."
+        if index % 3 == 0
+        else f"In this clinical scenario, {answer} is the best answer."
+        if index % 3 == 1
+        else f"Based on the findings described, choose {answer}."
+    )
+    return chat_example(
+        "\n\n".join(user_parts),
+        answer,
+        source="medqa",
+        group_id=f"medqa:{index}",
+    )
 
-    assistant = answer
-    if assistant and assistant[-1] not in ".!?":
-        assistant += "."
 
-    if looks_noisy(assistant):
-        return {"text": ""}
-    return {"text": format_phi3("\n\n".join(user_parts), assistant)}
+def sentence_chunks(text: str, max_chars: int = 1_800, overlap_chars: int = 180) -> Iterable[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", clean_text(text).replace("\n", " "))
+    buffer: list[str] = []
+    current_length = 0
 
-
-def sentence_chunks(text: str, max_chars: int = 1800, overlap_chars: int = 250) -> Iterable[str]:
-    # Préférer découper sur les paragraphes d'abord pour garder la cohérence sémantique
-    paragraphs = re.split(r"\n{2,}", text)
-    sentences = []
-    for p in paragraphs:
-        if p.strip():
-            sentences.extend(re.split(r"(?<=[.!?])\s+", p.strip()))
-
-    buffer: List[str] = []
-    current_len = 0
-
-    for sentence in sentences:
-        sentence = sentence.strip()
+    for sentence in (item.strip() for item in sentences):
         if not sentence:
             continue
-
         if len(sentence) > max_chars:
             if buffer:
-                yield " ".join(buffer).strip()
+                yield " ".join(buffer)
                 buffer = []
-                current_len = 0
-            for i in range(0, len(sentence), max_chars):
-                chunk = sentence[i:i + max_chars].strip()
+                current_length = 0
+            for start in range(0, len(sentence), max_chars):
+                chunk = sentence[start : start + max_chars].strip()
                 if chunk:
                     yield chunk
             continue
 
-        projected = current_len + len(sentence) + (1 if buffer else 0)
+        projected = current_length + len(sentence) + (1 if buffer else 0)
         if projected <= max_chars:
             buffer.append(sentence)
-            current_len = projected
-        else:
-            yield " ".join(buffer).strip()
-            
-            # Ajout d'overlap sémantique pour ne pas perdre le contexte
-            overlap = []
-            overlap_len = 0
-            for s in reversed(buffer):
-                if overlap_len + len(s) <= overlap_chars:
-                    overlap.insert(0, s)
-                    overlap_len += len(s) + 1
-                else:
-                    break
-            
-            buffer = overlap + [sentence]
-            current_len = overlap_len + len(sentence)
+            current_length = projected
+            continue
+
+        yield " ".join(buffer)
+        overlap: list[str] = []
+        overlap_length = 0
+        for previous in reversed(buffer):
+            if overlap_length + len(previous) > overlap_chars:
+                break
+            overlap.insert(0, previous)
+            overlap_length += len(previous) + 1
+        buffer = overlap + [sentence]
+        current_length = sum(map(len, buffer)) + max(0, len(buffer) - 1)
 
     if buffer:
-        yield " ".join(buffer).strip()
+        yield " ".join(buffer)
 
 
 def parse_turn(raw_turn: str) -> Optional[Tuple[str, str]]:
@@ -147,110 +160,184 @@ def parse_turn(raw_turn: str) -> Optional[Tuple[str, str]]:
     return role, text
 
 
-def meddialog_rows(example: dict) -> List[dict]:
+def meddialog_rows(example: dict, index: int) -> list[dict]:
     description = clean_text(example.get("description"))
     utterances = example.get("utterances") or []
-    parsed = [turn for turn in (parse_turn(u) for u in utterances) if turn is not None]
-    rows: List[dict] = []
+    parsed = [turn for turn in (parse_turn(item) for item in utterances) if turn]
+    rows = []
+    history: list[Tuple[str, str]] = []
 
-    if len(parsed) < 2:
-        return rows
+    for position, (role, text) in enumerate(parsed):
+        if role != "patient":
+            history.append((role, text))
+            continue
 
-    history: List[Tuple[str, str]] = []
-    for i, (role, text) in enumerate(parsed):
-        if role == "patient":
-            doctor_reply = ""
-            for j in range(i + 1, len(parsed)):
-                if parsed[j][0] == "doctor":
-                    doctor_reply = parsed[j][1]
-                    break
-
-            if doctor_reply and not looks_noisy(doctor_reply):
-                context_window = history[-4:] + [("patient", text)]
-                dialogue = []
-                for turn_role, turn_text in context_window:
-                    prefix = "Patient" if turn_role == "patient" else "Doctor"
-                    dialogue.append(f"{prefix}: {turn_text}")
-
-                user_parts = []
-                if description:
-                    user_parts.append(f"Case summary: {description}")
-                user_parts.append("Conversation:\n" + "\n".join(dialogue))
-                user_parts.append("Reply as the medical assistant to the latest patient message.")
-                user_message = "\n\n".join(user_parts)
-                rows.append({"text": format_phi3(user_message, doctor_reply)})
-
+        doctor_reply = next(
+            (reply for next_role, reply in parsed[position + 1 :] if next_role == "doctor"),
+            "",
+        )
+        if doctor_reply and not looks_noisy(doctor_reply):
+            dialogue = [
+                f"{'Patient' if turn_role == 'patient' else 'Doctor'}: {turn_text}"
+                for turn_role, turn_text in history[-4:] + [("patient", text)]
+            ]
+            user_parts = []
+            if description:
+                user_parts.append(f"Case summary: {description}")
+            user_parts.extend(
+                [
+                    "Conversation:\n" + "\n".join(dialogue),
+                    "Reply to the latest patient message. Be clear about uncertainty and urgent warning signs.",
+                ]
+            )
+            rows.append(
+                chat_example(
+                    "\n\n".join(user_parts),
+                    doctor_reply,
+                    source="meddialog",
+                    group_id=f"meddialog:{index}",
+                )
+            )
         history.append((role, text))
-
     return rows
 
 
-def save_mlx_format(dataset: Dataset, filename: str) -> None:
-    path = OUT_DIR / filename
-    with open(path, "w", encoding="utf-8") as handle:
-        for entry in dataset:
-            text = clean_text(entry["text"])
-            if text:
-                handle.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
-    print(f"✅ Sauvegardé : {path} ({len(dataset)} exemples)")
+def fingerprint(row: dict) -> str:
+    canonical = "\n".join(message["content"].casefold() for message in row["messages"])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-# ==========================================================
-# 1️⃣ Chargement des sources
-# ==========================================================
-print("📘 Chargement de MedQA...")
-MEDQA_PATH = RAW_DIR / "med_qa/data_clean/data_clean/questions/US/train.jsonl"
-medqa_raw = load_dataset("json", data_files=str(MEDQA_PATH))["train"]
-medqa = medqa_raw.map(format_medqa, remove_columns=medqa_raw.column_names)
-medqa = medqa.filter(lambda ex: bool(ex["text"]))
-print(f"   ↳ {len(medqa)} exemples retenus")
+def deduplicate(rows: Sequence[dict]) -> list[dict]:
+    seen: set[str] = set()
+    unique = []
+    for row in rows:
+        key = fingerprint(row)
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique
 
-print("📚 Chargement des Textbooks...")
-TEXTBOOK_DIR = RAW_DIR / "med_qa/data_clean/data_clean/textbooks/en"
-textbook_rows: List[dict] = []
-for file in sorted(TEXTBOOK_DIR.glob("*.txt")):
-    content = clean_text(file.read_text(encoding="utf-8", errors="ignore"))
-    if len(content) < 300:
-        continue
-    title = file.stem.replace("_", " ").strip()
-    user_prompt = f"Explain this medical topic for a clinical assistant: {title}"
-    for chunk in sentence_chunks(content, max_chars=1800):
-        if len(chunk) >= 120 and not looks_noisy(chunk):
-            textbook_rows.append({"text": format_phi3(user_prompt, chunk)})
 
-textbooks = Dataset.from_list(textbook_rows) if textbook_rows else Dataset.from_list([{"text": ""}]).filter(lambda _: False)
-print(f"   ↳ {len(textbooks)} exemples retenus")
+def grouped_split(rows: Sequence[dict], validation_ratio: float, seed: int) -> tuple[list[dict], list[dict]]:
+    if not 0 < validation_ratio < 0.5:
+        raise ValueError("validation_ratio must be between 0 and 0.5")
 
-print("💬 Chargement de MedDialog...")
-MEDDIALOG_PATH = BASE_DIR / "processed/english-train.json"
-meddialog_raw = load_dataset("json", data_files=str(MEDDIALOG_PATH))["train"]
-dialog_rows: List[dict] = []
-for sample in meddialog_raw:
-    dialog_rows.extend(meddialog_rows(sample))
-meddialog = Dataset.from_list(dialog_rows) if dialog_rows else Dataset.from_list([{"text": ""}]).filter(lambda _: False)
-print(f"   ↳ {len(meddialog)} exemples retenus")
+    by_source: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        by_source[row["source"]][row["group_id"]].append(row)
 
-# ==========================================================
-# 2️⃣ Fusion + split
-# ==========================================================
-print("🧩 Fusion des sources...")
-parts = [ds for ds in [medqa, textbooks, meddialog] if len(ds) > 0]
-if not parts:
-    raise RuntimeError("Aucun exemple valide généré. Vérifiez les données sources.")
+    train: list[dict] = []
+    valid: list[dict] = []
+    for source, groups_by_id in sorted(by_source.items()):
+        groups = list(groups_by_id.values())
+        random.Random(f"{seed}:{source}").shuffle(groups)
+        target = max(1, round(sum(map(len, groups)) * validation_ratio)) if len(groups) > 1 else 0
+        validation_count = 0
+        for group in groups:
+            if validation_count < target and len(groups) > 1:
+                valid.extend(group)
+                validation_count += len(group)
+            else:
+                train.extend(group)
 
-combined = concatenate_datasets(parts).shuffle(seed=42)
-print(f"✅ Total final: {len(combined)} exemples")
+    random.Random(seed).shuffle(train)
+    random.Random(seed + 1).shuffle(valid)
+    return train, valid
 
-split_idx = max(1, int(len(combined) * 0.9))
-if split_idx >= len(combined):
-    split_idx = len(combined) - 1
-train_data = combined.select(range(split_idx))
-valid_data = combined.select(range(split_idx, len(combined)))
 
-# ==========================================================
-# 3️⃣ Export JSONL pour MLX
-# ==========================================================
-save_mlx_format(train_data, "train.jsonl")
-save_mlx_format(valid_data, "valid.jsonl")
+def save_jsonl(rows: Sequence[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    temporary.replace(path)
 
-print("\n🎉 Dataset prêt pour MLX.")
+
+def build_rows(
+    raw_dir: Path,
+    meddialog_path: Path,
+    max_medqa_examples: int,
+    max_textbook_examples: int,
+    seed: int,
+) -> list[dict]:
+    medqa_path = raw_dir / "med_qa/data_clean/data_clean/questions/US/train.jsonl"
+    textbook_dir = raw_dir / "med_qa/data_clean/data_clean/textbooks/en"
+    for required in (medqa_path, textbook_dir):
+        if not required.exists():
+            raise FileNotFoundError(f"Required data source not found: {required}")
+
+    rows: list[dict] = []
+    medqa = load_dataset(
+        "json",
+        data_files=str(medqa_path),
+        split="train",
+        cache_dir=str(DATASET_CACHE),
+    )
+    medqa_rows = list(filter(None, (format_medqa(example, i) for i, example in enumerate(medqa))))
+    if max_medqa_examples > 0 and len(medqa_rows) > max_medqa_examples:
+        random.Random(seed).shuffle(medqa_rows)
+        medqa_rows = medqa_rows[:max_medqa_examples]
+    rows.extend(medqa_rows)
+
+    textbook_rows = []
+    for file in sorted(textbook_dir.glob("*.txt")):
+        content = file.read_text(encoding="utf-8", errors="ignore")
+        if len(content) < 300:
+            continue
+        title = file.stem.replace("_", " ").strip()
+        prompt = f"Explain this medical topic for a clinical assistant: {title}"
+        for chunk in sentence_chunks(content, max_chars=900, overlap_chars=0):
+            if len(chunk) >= 120 and not looks_noisy(chunk):
+                textbook_rows.append(
+                    chat_example(
+                        prompt,
+                        chunk,
+                        source="textbook",
+                        group_id=f"textbook:{file.stem}",
+                    )
+                )
+
+    if max_textbook_examples > 0 and len(textbook_rows) > max_textbook_examples:
+        random.Random(seed).shuffle(textbook_rows)
+        textbook_rows = textbook_rows[:max_textbook_examples]
+    rows.extend(textbook_rows)
+
+    if meddialog_path.exists():
+        meddialog = load_dataset(
+            "json",
+            data_files=str(meddialog_path),
+            split="train",
+            cache_dir=str(DATASET_CACHE),
+        )
+        for index, sample in enumerate(meddialog):
+            rows.extend(meddialog_rows(sample, index))
+    else:
+        print(f"Optional MedDialog source not found; skipping: {meddialog_path}")
+    return rows
+
+
+def main() -> int:
+    args = parse_args()
+    print("Preparing medical chat dataset for MLX…")
+    rows = build_rows(
+        args.raw_dir,
+        args.meddialog_path,
+        args.max_medqa_examples,
+        args.max_textbook_examples,
+        args.seed,
+    )
+    unique_rows = deduplicate(rows)
+    train, valid = grouped_split(unique_rows, args.validation_ratio, args.seed)
+    save_jsonl(train, args.out_dir / "train.jsonl")
+    save_jsonl(valid, args.out_dir / "valid.jsonl")
+
+    sources = Counter(row["source"] for row in unique_rows)
+    print(f"Saved {len(train):,} train / {len(valid):,} validation examples")
+    print(f"Removed {len(rows) - len(unique_rows):,} exact duplicates")
+    print("Sources:", ", ".join(f"{name}={count:,}" for name, count in sorted(sources.items())))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

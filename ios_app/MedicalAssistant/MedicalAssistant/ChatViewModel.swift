@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// ViewModel principal du chat médical
 @MainActor
@@ -7,10 +10,12 @@ final class ChatViewModel: ObservableObject {
     @Published var sessions: [ChatSession] = []
     @Published var activeSessionId: UUID?
     @Published var messages: [Message] = []           // Historique des messages
-    @Published var currentInput: String = ""          // Texte saisi par l’utilisateur
     @Published var isGenerating: Bool = false
     @Published var errorMessage: String? = nil
-    @Published private(set) var lastSubmittedUserMessageID: UUID?
+
+    var activeSession: ChatSession? {
+        sessions.first(where: { $0.id == activeSessionId })
+    }
 
     // MARK: - Composants internes
     private var _mlx: MLXRunner?
@@ -30,9 +35,12 @@ final class ChatViewModel: ObservableObject {
     private let store = MessageStore()
     private var saveTask: Task<Void, Never>?
     private var generationTask: Task<Void, Never>?
+    private var memoryObserver: Any?
 
     // MARK: - Initialisation
     init(previewMode: Bool = false) {
+        setupMemoryWarningObserver()
+
         if previewMode {
             self.messages = [
                 Message(text: "Bonjour docteur, j’ai mal à la tête depuis ce matin.", isUser: true),
@@ -43,9 +51,9 @@ final class ChatViewModel: ObservableObject {
             self.activeSessionId = previewSession.id
             print("🧩 ChatViewModel lancé en mode Preview — modèle non chargé.")
         } else {
-            // We use Task because loadSessions could theoretically block, but here it's swift
-            Task {
-                let loaded = self.store.loadSessions()
+            Task { [weak self] in
+                guard let self else { return }
+                let loaded = await self.store.loadSessions()
                 self.sessions = loaded
                 if let recent = loaded.sorted(by: { $0.updatedAt > $1.updatedAt }).first {
                     self.activeSessionId = recent.id
@@ -58,18 +66,47 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    deinit {
+        if let memoryObserver {
+            NotificationCenter.default.removeObserver(memoryObserver)
+        }
+    }
+
+    private func setupMemoryWarningObserver() {
+        #if canImport(UIKit)
+        memoryObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleMemoryWarning()
+        }
+        #endif
+    }
+
+    private func handleMemoryWarning() {
+        print("🚨 ChatViewModel: Avertissement de mémoire reçu d'iOS!")
+        if isGenerating {
+            Task { [weak self] in
+                await self?._mlx?.clearInferenceCache()
+            }
+        } else {
+            unloadModel()
+        }
+    }
+
     // MARK: - Envoi de message
-    func sendMessage() {
-        let inputText = currentInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    func sendMessage(_ text: String) {
+        let inputText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !inputText.isEmpty, !isGenerating else { return }
+
+        SpeechSynthesizerManager.shared.stop()
 
         // Ajoute le message utilisateur
         let userMessage = Message(text: inputText, isUser: true)
         messages.append(userMessage)
-        lastSubmittedUserMessageID = userMessage.id
         let contextMessages = messages
         HapticsHelper.playLightImpact()
-        currentInput = ""
         errorMessage = nil
         persistMessages()
 
@@ -86,59 +123,69 @@ final class ChatViewModel: ObservableObject {
             if let runner = self.mlx {
                 do {
                     var accumulatedResponse = ""
+                    var lastRenderedResponse = ""
+                    let renderClock = ContinuousClock()
+                    var lastRender = renderClock.now
                     let stream = await runner.generateResponseStream(for: inputText, history: contextMessages)
                     for try await chunk in stream {
+                        guard !Task.isCancelled else { return }
                         accumulatedResponse += chunk
-                        if !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            await MainActor.run {
-                                HapticsHelper.playTokenTick(for: chunk)
-                            }
-                        }
-                        await MainActor.run {
+
+                        // Coalesce very fast token streams. Re-parsing Markdown and laying out
+                        // the entire chat for every token is one of the largest sources of UI hitches.
+                        let now = renderClock.now
+                        let shouldRender = lastRender.duration(to: now) >= .milliseconds(50)
+                            || chunk.contains(where: { ".!?\n".contains($0) })
+                        if shouldRender, accumulatedResponse != lastRenderedResponse {
                             self.updateMessage(id: assistantId, text: accumulatedResponse, isPartial: true)
+                            HapticsHelper.playTokenTick(for: chunk)
+                            lastRenderedResponse = accumulatedResponse
+                            lastRender = now
                         }
                     }
-                    await MainActor.run {
-                        self.updateMessage(id: assistantId, text: accumulatedResponse, isPartial: false)
-                        self.isGenerating = false
-                        self.persistMessages()
-                        HapticsHelper.playLightImpact()
-                    }
-                } catch {
-                    await MainActor.run {
-                        if !Task.isCancelled {
-                            self.updateMessage(id: assistantId, text: "⚠️ Erreur: \(error.localizedDescription)", isPartial: false)
-                        }
-                        self.isGenerating = false
-                        self.persistMessages()
-                    }
-                }
-            } else {
-                await MainActor.run {
-                    self.updateMessage(id: assistantId, text: "⚠️ Modèle MLX indisponible.", isPartial: false)
+                    guard !Task.isCancelled else { return }
+                    self.updateMessage(id: assistantId, text: accumulatedResponse, isPartial: false)
                     self.isGenerating = false
                     self.persistMessages()
+                    HapticsHelper.playLightImpact()
+                    await runner.clearInferenceCache()
+                } catch {
+                    if !Task.isCancelled {
+                        self.updateMessage(id: assistantId, text: "⚠️ Erreur: \(error.localizedDescription)", isPartial: false)
+                    }
+                    self.isGenerating = false
+                    self.persistMessages()
+                    await runner.clearInferenceCache()
                 }
+            } else {
+                self.updateMessage(id: assistantId, text: "⚠️ Modèle MLX indisponible.", isPartial: false)
+                self.isGenerating = false
+                self.persistMessages()
             }
         }
     }
 
     func cancelGeneration() {
+        SpeechSynthesizerManager.shared.stop()
         generationTask?.cancel()
         generationTask = nil
         isGenerating = false
         if let idx = messages.lastIndex(where: { !$0.isUser && $0.isPartial }) {
             if messages[idx].text.isEmpty {
-                messages[idx].text = "(Generation cancelled)"
+                messages[idx].text = "Génération interrompue."
             }
             messages[idx].isPartial = false
         }
         persistMessages()
+        Task { [weak self] in
+            await self?._mlx?.clearInferenceCache()
+        }
     }
 
     // MARK: - Sessions Management
     
     func createNewSession() {
+        SpeechSynthesizerManager.shared.stop()
         cancelGeneration()
         let newSession = ChatSession(title: "Nouvelle discussion", messages: [])
         sessions.insert(newSession, at: 0)
@@ -149,14 +196,26 @@ final class ChatViewModel: ObservableObject {
     
     func switchSession(to id: UUID) {
         guard id != activeSessionId else { return }
+        SpeechSynthesizerManager.shared.stop()
         cancelGeneration()
         if let session = sessions.first(where: { $0.id == id }) {
             activeSessionId = session.id
             messages = session.messages
         }
     }
+
+    func renameSession(id: UUID, newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let idx = sessions.firstIndex(where: { $0.id == id }) {
+            sessions[idx].title = trimmed
+            sessions[idx].updatedAt = Date()
+            persistMessages(delay: .zero)
+        }
+    }
     
     func deleteSession(id: UUID) {
+        SpeechSynthesizerManager.shared.stop()
         sessions.removeAll(where: { $0.id == id })
         if activeSessionId == id {
             if let first = sessions.first {
@@ -166,7 +225,18 @@ final class ChatViewModel: ObservableObject {
                 createNewSession()
             }
         }
-        store.saveSessions(sessions)
+        persistMessages(delay: .zero)
+    }
+
+    func clearAllSessions() {
+        SpeechSynthesizerManager.shared.stop()
+        cancelGeneration()
+        sessions.removeAll()
+        messages.removeAll()
+        createNewSession()
+        Task { [store] in
+            await store.clearAll()
+        }
     }
 
     private func syncActiveSession() {
@@ -205,8 +275,7 @@ final class ChatViewModel: ObservableObject {
         
         // Remove everything after the target user message
         messages.removeSubrange(targetUserIdx...)
-        currentInput = targetText
-        sendMessage()
+        sendMessage(targetText)
     }
 
     func editMessage(id: UUID, newText: String) {
@@ -216,22 +285,16 @@ final class ChatViewModel: ObservableObject {
         
         // Remove everything after this message
         messages.removeSubrange(idx...)
-        currentInput = newText
-        sendMessage()
-    }
-
-    func setPerformance(preferGPU: Bool) {
-        _ = preferGPU
-        print("ℹ️ Le toggle CPU/GPU est maintenu pour l'UI, mais on ne recharge pas le modèle pour éviter les fuites.")
+        sendMessage(newText)
     }
 
     func unloadModel() {
-        print("🧹 Mise en arrière-plan. On maintient le modèle en mémoire : iOS compressera la RAM automatiquement.")
         cancelGeneration()
-    }
-
-    func clearComposerMorph() {
-        lastSubmittedUserMessageID = nil
+        guard let runner = _mlx else { return }
+        _mlx = nil
+        Task(priority: .utility) {
+            await runner.unloadModel()
+        }
     }
 
     // MARK: - Helpers
@@ -241,15 +304,16 @@ final class ChatViewModel: ObservableObject {
         messages[idx].isPartial = isPartial
     }
 
-    private func persistMessages() {
+    private func persistMessages(delay: Duration = .milliseconds(300)) {
         syncActiveSession()
+        let snapshot = sessions
         saveTask?.cancel()
-        saveTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            await MainActor.run {
-                guard let self = self else { return }
-                self.store.saveSessions(self.sessions)
+        saveTask = Task { [store] in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
             }
+            guard !Task.isCancelled else { return }
+            await store.saveSessions(snapshot)
         }
     }
 }

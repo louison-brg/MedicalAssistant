@@ -18,13 +18,12 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    DataCollatorForLanguageModeling,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a causal LM checkpoint.")
-    parser.add_argument("--model-path", default="training/models/phi3-medprof_final_full")
+    parser.add_argument("--model-path", default="training/models/phi3-medprof-merged")
     parser.add_argument("--data-path", default="training/data/processed_professor_phi3_hf")
     parser.add_argument("--reports-dir", default="training/reports")
     parser.add_argument("--max-samples", type=int, default=2000)
@@ -34,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlflow-uri", default="file:./mlruns")
     parser.add_argument("--mlflow-experiment", default="model-evaluation")
     parser.add_argument("--prompt-file", default=None, help="Optional file with one prompt per line")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -53,7 +53,7 @@ def resolve_device(requested: str) -> tuple[str, torch.dtype]:
         device = "cpu"
 
     if device == "mps":
-        dtype = torch.float32
+        dtype = torch.float16
     elif device == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     else:
@@ -64,17 +64,38 @@ def resolve_device(requested: str) -> tuple[str, torch.dtype]:
 def load_prompts(path: Optional[str]) -> List[str]:
     if not path:
         return [
-            "Patient: I have a persistent cough and chest pain. What could this be?\nDoctor:",
-            "Question: What is the treatment for type 2 diabetes in obese patients?\nAnswer:",
-            "Patient: My throat hurts and I feel feverish for 3 days. What should I do?\nDoctor:",
+            "I have a persistent cough and chest pain. What could this be?",
+            "What is the usual treatment approach for type 2 diabetes in an obese patient?",
+            "My throat hurts and I have felt feverish for three days. What should I do?",
         ]
     with open(path, "r", encoding="utf-8") as f:
         lines = [ln.strip() for ln in f.readlines()]
     return [ln for ln in lines if ln]
 
 
+class AssistantOnlyCollator:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features):
+        inputs = [
+            {"input_ids": item["input_ids"], "attention_mask": item["attention_mask"]}
+            for item in features
+        ]
+        batch = self.tokenizer.pad(inputs, padding=True, return_tensors="pt")
+        target_length = batch["input_ids"].shape[1]
+        labels = []
+        for item in features:
+            row = list(item["labels"])
+            padding = [-100] * (target_length - len(row))
+            labels.append(padding + row if self.tokenizer.padding_side == "left" else row + padding)
+        batch["labels"] = torch.tensor(labels, dtype=torch.long)
+        return batch
+
+
 def main() -> None:
     args = parse_args()
+    torch.manual_seed(args.seed)
     os.makedirs(args.reports_dir, exist_ok=True)
 
     device, dtype = resolve_device(args.device)
@@ -113,7 +134,25 @@ def main() -> None:
             eval_dataset = dataset
 
         # Prepare data
-        if "text" in eval_dataset.column_names:
+        if "messages" in eval_dataset.column_names:
+            def tokenize_messages(example):
+                ids = tokenizer.apply_chat_template(
+                    example["messages"], tokenize=True, add_generation_prompt=False
+                )[: args.max_length]
+                prompt_ids = tokenizer.apply_chat_template(
+                    example["messages"][:-1], tokenize=True, add_generation_prompt=True
+                )
+                prompt_length = min(len(prompt_ids), len(ids))
+                return {
+                    "input_ids": ids,
+                    "attention_mask": [1] * len(ids),
+                    "labels": [-100] * prompt_length + ids[prompt_length:],
+                }
+            eval_dataset = eval_dataset.map(
+                tokenize_messages,
+                remove_columns=eval_dataset.column_names,
+            )
+        elif "text" in eval_dataset.column_names:
             def tokenize(batch):
                 return tokenizer(
                     batch["text"],
@@ -125,17 +164,29 @@ def main() -> None:
         if "labels" not in eval_dataset.column_names and "input_ids" in eval_dataset.column_names:
             eval_dataset = eval_dataset.map(lambda ex: {"labels": ex["input_ids"]})
 
+        if "input_ids" in eval_dataset.column_names:
+            def truncate(example):
+                return {
+                    key: example[key][: args.max_length]
+                    for key in ("input_ids", "attention_mask", "labels")
+                    if key in example
+                }
+            eval_dataset = eval_dataset.map(truncate)
+            eval_dataset = eval_dataset.filter(
+                lambda example: any(label != -100 for label in example["labels"])
+            )
+
         if args.max_samples and len(eval_dataset) > args.max_samples:
             eval_dataset = eval_dataset.select(range(args.max_samples))
 
     # Perplexity
     perplexity = None
     if eval_dataset is not None:
-        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+        data_collator = AssistantOnlyCollator(tokenizer)
         eval_args = TrainingArguments(
             output_dir="training/models/eval_output",
             per_device_eval_batch_size=1,
-            dataloader_drop_last=True,
+            dataloader_drop_last=False,
             report_to=[],
         )
         trainer = Trainer(model=model, args=eval_args, eval_dataset=eval_dataset, data_collator=data_collator)
@@ -143,7 +194,7 @@ def main() -> None:
         eval_results = trainer.evaluate()
         loss_key = "eval_loss" if "eval_loss" in eval_results else "loss" if "loss" in eval_results else None
         if loss_key:
-            perplexity = math.exp(eval_results[loss_key])
+            perplexity = math.exp(min(eval_results[loss_key], 20))
             print(f"✅ Perplexity: {perplexity:.2f}")
         else:
             print("⚠️ No loss found; perplexity not computed.")
@@ -154,19 +205,25 @@ def main() -> None:
     print("\n🩺 Sample generations:")
     for prompt in prompts:
         print(f"\nPrompt: {prompt}\n---")
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
+        rendered_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = tokenizer(rendered_prompt, return_tensors="pt").to(device)
+        with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=120,
-                temperature=0.7,
-                top_p=0.95,
-                do_sample=True,
+                do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
-                use_cache=False,
+                use_cache=True,
             )
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        text = tokenizer.decode(
+            outputs[0, inputs["input_ids"].shape[1] :],
+            skip_special_tokens=True,
+        ).strip()
         print(text)
         generated.append((prompt, text))
 

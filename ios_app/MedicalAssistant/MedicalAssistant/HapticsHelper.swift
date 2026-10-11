@@ -7,10 +7,11 @@ import UIKit
 
 /// Provides debounced haptic feedback to avoid Taptic Engine saturation
 /// during high-frequency token generation.
+@MainActor
 enum HapticsHelper {
     #if canImport(UIKit)
-    private static let heavyGenerator = UIImpactFeedbackGenerator(style: .heavy)
-    private static let mediumGenerator = UIImpactFeedbackGenerator(style: .medium)
+    private static let actionGenerator = UIImpactFeedbackGenerator(style: .light)
+    private static let tokenGenerator = UISelectionFeedbackGenerator()
     #endif
 
     /// Minimum interval between token ticks (~6 per second max).
@@ -27,8 +28,8 @@ enum HapticsHelper {
     /// Light impact for discrete user actions (send message, etc.).
     static func playLightImpact() {
         #if canImport(UIKit)
-        heavyGenerator.prepare()
-        heavyGenerator.impactOccurred(intensity: 1.0)
+        actionGenerator.prepare()
+        actionGenerator.impactOccurred(intensity: 0.75)
         #endif
     }
 
@@ -48,8 +49,8 @@ enum HapticsHelper {
         if hasSentenceEnd {
             lastTokenTickDate = now
             #if canImport(UIKit)
-            heavyGenerator.prepare()
-            heavyGenerator.impactOccurred(intensity: 0.85)
+            actionGenerator.prepare()
+            actionGenerator.impactOccurred(intensity: 0.45)
             #endif
             return
         }
@@ -59,8 +60,8 @@ enum HapticsHelper {
         lastTokenTickDate = now
 
         #if canImport(UIKit)
-        mediumGenerator.prepare()
-        mediumGenerator.impactOccurred(intensity: 0.7)
+        tokenGenerator.prepare()
+        tokenGenerator.selectionChanged()
         #endif
     }
 }

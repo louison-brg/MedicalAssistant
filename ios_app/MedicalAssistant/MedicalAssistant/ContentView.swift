@@ -1,15 +1,21 @@
-import SwiftUI
 import LocalAuthentication
+import SwiftUI
 
 struct ContentView: View {
-    @Environment(\.scenePhase) var scenePhase
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var viewModel: ChatViewModel
-    @State private var preferGPU: Bool = true
-    @FocusState private var inputFocused: Bool
-    @State private var isUnlocked: Bool = false
-    @State private var showingHistory: Bool = false
+
+    @State private var isUnlocked = false
+    @State private var isAuthenticating = false
+    @State private var authenticationMessage: String?
+    @State private var showingHistory = false
+    @State private var showingMedicalInfo = false
+    @State private var showingRenameDialog = false
+    @State private var showingClearConfirmation = false
+    @State private var renameText = ""
     @State private var scrollPosition: UUID?
-    @Namespace private var composerNamespace
+    @State private var isScrolledUp = false
 
     init() {
         _viewModel = StateObject(wrappedValue: ChatViewModel())
@@ -22,41 +28,33 @@ struct ContentView: View {
     var body: some View {
         Group {
             if isUnlocked {
-                mainChatView
+                chat
             } else {
-                lockedView
+                lockScreen
             }
         }
+        .preferredColorScheme(.dark)
         .onAppear(perform: authenticate)
-        .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .background {
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
                 viewModel.unloadModel()
                 isUnlocked = false
-            } else if newPhase == .active && !isUnlocked {
+            case .active where !isUnlocked:
                 authenticate()
-            }
-        }
-        .onChange(of: viewModel.lastSubmittedUserMessageID) { _, submittedID in
-            guard submittedID != nil else { return }
-            Task {
-                try? await Task.sleep(nanoseconds: 550_000_000)
-                await MainActor.run {
-                    viewModel.clearComposerMorph()
-                }
+            default:
+                break
             }
         }
     }
 
-    private var accentColor: Color {
-        ChatTheme.electricBlue
-    }
+    // MARK: - Main chat
 
-    private var accentGradient: LinearGradient {
-        ChatTheme.accentGradient(load: 0)
-    }
+    private var chat: some View {
+        ZStack {
+            ChatBackground()
+                .ignoresSafeArea()
 
-    private var mainChatView: some View {
-        GlassEffectContainer(spacing: 26) {
             VStack(spacing: 0) {
                 header
 
@@ -71,457 +69,691 @@ struct ContentView: View {
                 }
             }
         }
-        .background(backgroundView.ignoresSafeArea())
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            inputBar
+            ChatComposer(
+                isGenerating: viewModel.isGenerating,
+                onSend: viewModel.sendMessage,
+                onStop: viewModel.cancelGeneration
+            )
         }
-        .onTapGesture { inputFocused = false }
-    }
-
-    // MARK: - Authentication
-    private func authenticate() {
-        let context = LAContext()
-        var error: NSError?
-
-        if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) {
-            let reason = "Unlock MedLLM to access your medical conversations."
-            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, authenticationError in
-                DispatchQueue.main.async {
-                    if success {
-                        self.isUnlocked = true
-                    } else {
-                        // Fallback or retry
-                    }
+        .sheet(isPresented: $showingHistory) {
+            ChatHistoryView(viewModel: viewModel)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(.ultraThinMaterial)
+        }
+        .sheet(isPresented: $showingMedicalInfo) {
+            MedicalDisclaimerView(isDismissable: true) {
+                showingMedicalInfo = false
+            }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(.ultraThinMaterial)
+        }
+        .alert("Renommer la discussion", isPresented: $showingRenameDialog) {
+            TextField("Titre de la consultation", text: $renameText)
+            Button("Annuler", role: .cancel) {}
+            Button("Enregistrer") {
+                if let id = viewModel.activeSessionId {
+                    viewModel.renameSession(id: id, newTitle: renameText)
                 }
             }
-        } else {
-            // No biometrics available, unlock by default or handle passcode
-            self.isUnlocked = true
         }
-    }
-
-    private var lockedView: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "lock.fill")
-                .font(.system(size: 50))
-                .foregroundColor(accentColor)
-            Text("MedLLM is Locked")
-                .font(.title2.bold())
-                .foregroundColor(.white)
-            Button("Unlock") {
-                authenticate()
+        .confirmationDialog(
+            "Effacer cette discussion ?",
+            isPresented: $showingClearConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Effacer les messages", role: .destructive) {
+                withAnimation {
+                    viewModel.clearMessages()
+                }
             }
-            .padding()
-            .background(accentGradient)
-            .clipShape(Capsule())
-            .foregroundColor(.white)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(backgroundView.ignoresSafeArea())
-    }
-
-    // MARK: - Background
-
-    private var backgroundView: some View {
-        ZStack {
-            // Rich MeshGradient for Liquid Glass refraction
-            MeshGradient(
-                width: 3,
-                height: 3,
-                points: [
-                    [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
-                    [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
-                    [0.0, 1.0], [0.5, 1.0], [1.0, 1.0]
-                ],
-                colors: [
-                    Color(red: 0.04, green: 0.04, blue: 0.12),  // deep navy
-                    Color(red: 0.06, green: 0.05, blue: 0.16),  // midnight indigo
-                    Color(red: 0.05, green: 0.08, blue: 0.14),  // dark teal-navy
-
-                    Color(red: 0.08, green: 0.06, blue: 0.18),  // deep violet
-                    Color(red: 0.06, green: 0.06, blue: 0.10),  // center base
-                    Color(red: 0.04, green: 0.10, blue: 0.16),  // teal accent
-
-                    Color(red: 0.10, green: 0.08, blue: 0.22),  // violet glow
-                    Color(red: 0.05, green: 0.07, blue: 0.14),  // deep blue
-                    Color(red: 0.06, green: 0.12, blue: 0.18)   // teal edge
-                ]
-            )
-
-            // Scroll-reactive diffuse glow – keeps the glass alive
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [
-                            accentColor.opacity(0.28),
-                            Color.clear
-                        ],
-                        center: .center,
-                        startRadius: 0,
-                        endRadius: 300
-                    )
-                )
-                .frame(width: 500, height: 500)
-                .offset(x: -150, y: -250)
-                .blur(radius: 78)
-
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [
-                            ChatTheme.deepViolet.opacity(0.18),
-                            Color.clear
-                        ],
-                        center: .center,
-                        startRadius: 0,
-                        endRadius: 250
-                    )
-                )
-                .frame(width: 400, height: 400)
-                .offset(x: 120, y: 350)
-                .blur(radius: 70)
-
-            Color.white.opacity(0.012)
-
-            Rectangle()
-                .fill(.ultraThinMaterial.opacity(0.04))
-                .blur(radius: 18)
-                .blendMode(.screen)
+            Button("Annuler", role: .cancel) {}
+        } message: {
+            Text("Tous les messages de la consultation active seront effacés.")
         }
     }
 
     // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 12) {
-            Button {
+        HStack(spacing: 10) {
+            headerButton(systemName: "line.3.horizontal") {
+                HapticsHelper.playLightImpact()
                 showingHistory = true
+            }
+            .accessibilityLabel("Historique des conversations")
+
+            // Brand avatar (tappable for disclaimer & emergency info)
+            Button {
+                HapticsHelper.playLightImpact()
+                showingMedicalInfo = true
             } label: {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white)
+                ZStack {
+                    Circle()
+                        .fill(ChatTheme.heroCrossGradient)
+                    Image(systemName: "cross.case.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 36, height: 36)
+                .shadow(color: ChatTheme.auroraCyan.opacity(0.35), radius: 10, y: 2)
             }
-            .padding(.trailing, 4)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Informations et urgences médicales")
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(viewModel.sessions.first(where: { $0.id == viewModel.activeSessionId })?.title ?? "MedLLM")
-                    .font(ChatTheme.headerTitle)
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                Text("On-device medical assistant")
-                    .font(ChatTheme.headerSubtitle)
-                    .foregroundStyle(.white.opacity(0.5))
+            // Title and offline indicator
+            Button {
+                renameText = activeSessionTitle
+                showingRenameDialog = true
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(activeSessionTitle)
+                            .font(ChatTheme.headerTitle)
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Image(systemName: "pencil")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(viewModel.isGenerating ? ChatTheme.auroraCyan : ChatTheme.emerald)
+                            .frame(width: 5, height: 5)
+                            .shadow(color: (viewModel.isGenerating ? ChatTheme.auroraCyan : ChatTheme.emerald).opacity(0.8), radius: 3)
+                        Text(viewModel.isGenerating ? "Analyse en cours…" : "IA locale · Privé")
+                            .font(ChatTheme.headerSubtitle)
+                            .foregroundStyle(.white.opacity(0.55))
+                    }
+                }
             }
+            .buttonStyle(.plain)
 
-            Spacer()
-
-            gpuToggle
+            Spacer(minLength: 6)
 
             Button {
-                withAnimation(.spring(response: 0.35)) {
+                showingMedicalInfo = true
+            } label: {
+                privacyBadge
+            }
+            .buttonStyle(.plain)
+
+            // More actions Menu
+            Menu {
+                if let active = viewModel.activeSession, !active.messages.isEmpty {
+                    ShareLink(item: active.exportText()) {
+                        Label("Partager la consultation", systemImage: "square.and.arrow.up")
+                    }
+                }
+
+                Button {
+                    renameText = activeSessionTitle
+                    showingRenameDialog = true
+                } label: {
+                    Label("Renommer la discussion", systemImage: "pencil")
+                }
+
+                Button {
+                    showingMedicalInfo = true
+                } label: {
+                    Label("Urgences & Avertissement", systemImage: "cross.case")
+                }
+
+                if !viewModel.messages.isEmpty {
+                    Divider()
+                    Button(role: .destructive) {
+                        showingClearConfirmation = true
+                    } label: {
+                        Label("Effacer les messages", systemImage: "trash")
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .frame(width: 36, height: 36)
+                    .background(
+                        Circle()
+                            .fill(.ultraThinMaterial)
+                            .overlay(
+                                Circle().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                            )
+                    )
+                    .shadow(color: Color.black.opacity(0.15), radius: 4, y: 2)
+            }
+
+            headerButton(systemName: "square.and.pencil") {
+                HapticsHelper.playLightImpact()
+                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) {
                     viewModel.createNewSession()
                 }
-            } label: {
-                Image(systemName: "square.and.pencil")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(.white)
             }
+            .accessibilityLabel("Nouvelle conversation")
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 14)
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
         .padding(.bottom, 12)
-        .background(
-            UnevenRoundedRectangle(
-                topLeadingRadius: 0,
-                bottomLeadingRadius: 26,
-                bottomTrailingRadius: 26,
-                topTrailingRadius: 0
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) {
+            LinearGradient(
+                colors: [
+                    .clear,
+                    ChatTheme.auroraCyan.opacity(0.3),
+                    ChatTheme.electricBlue.opacity(0.15),
+                    .clear
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
             )
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    UnevenRoundedRectangle(
-                        topLeadingRadius: 0,
-                        bottomLeadingRadius: 26,
-                        bottomTrailingRadius: 26,
-                        topTrailingRadius: 0
-                    )
-                    .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
-                )
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(accentColor.opacity(0.18))
-                        .frame(height: 1)
-                        .blur(radius: 3)
-                }
-                .ignoresSafeArea(.container, edges: .top)
-        )
-        .sheet(isPresented: $showingHistory) {
-            ChatHistoryView(viewModel: viewModel)
+            .frame(height: 0.6)
         }
     }
 
-    private var gpuToggle: some View {
-        Button {
-            preferGPU.toggle()
-            viewModel.setPerformance(preferGPU: preferGPU)
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: preferGPU ? "bolt.fill" : "cpu")
-                    .font(.system(size: 10, weight: .bold))
-                Text(preferGPU ? "GPU" : "CPU")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(
-                Capsule()
-                    .fill(preferGPU ? AnyShapeStyle(accentGradient) : AnyShapeStyle(.ultraThinMaterial))
-                    .overlay(
-                        Capsule()
-                            .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
-                    )
-            )
-            .shadow(color: preferGPU ? accentColor.opacity(0.3) : .clear, radius: 6, y: 2)
-        }
-        .buttonStyle(.plain)
-        .animation(.spring(response: 0.3), value: preferGPU)
+    private var activeSessionTitle: String {
+        viewModel.sessions.first(where: { $0.id == viewModel.activeSessionId })?.title ?? "MedLLM"
     }
 
-    // MARK: - Empty State
-
-    private var emptyState: some View {
-        VStack(spacing: 20) {
-            Spacer()
-
-            // Glowing icon
-            ZStack {
-                Circle()
-                    .fill(accentColor.opacity(0.12))
-                    .frame(width: 100, height: 100)
-                    .blur(radius: 20)
-
-                Image(systemName: "stethoscope")
-                    .font(.system(size: 46, weight: .light))
-                    .foregroundStyle(accentColor.opacity(0.8))
-            }
-
-            Text("How can I help?")
-                .font(ChatTheme.emptyStateTitle)
-                .foregroundStyle(.white.opacity(0.85))
-
-            Text("Ask any medical question.\nResponses are generated entirely on your device.")
-                .font(ChatTheme.emptyStateBody)
-                .foregroundStyle(.white.opacity(0.4))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 36)
-
-            // Suggestion chips
-            VStack(spacing: 10) {
-                suggestionChip("What causes persistent headaches?")
-                suggestionChip("Symptoms of vitamin D deficiency")
-                suggestionChip("How to lower blood pressure naturally")
-            }
-            .padding(.top, 8)
-
-            Spacer()
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func suggestionChip(_ text: String) -> some View {
-        Button {
-            viewModel.currentInput = text
-            viewModel.sendMessage()
-        } label: {
-            Text(text)
-                .font(.system(size: 14, weight: .medium, design: .rounded))
-                .foregroundStyle(.white.opacity(0.65))
-                .padding(.horizontal, 18)
-                .padding(.vertical, 10)
+    private func headerButton(systemName: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.88))
+                .frame(width: 36, height: 36)
                 .background(
-                    Capsule()
+                    Circle()
                         .fill(.ultraThinMaterial)
                         .overlay(
-                            Capsule()
-                                .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
+                            Circle()
+                                .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
                         )
                 )
+                .shadow(color: Color.black.opacity(0.15), radius: 4, y: 2)
         }
         .buttonStyle(.plain)
     }
 
-    // MARK: - Message List
+    private var privacyBadge: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "shield.lefthalf.filled")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(ChatTheme.mint)
+            Text("100% LOCAL")
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .tracking(0.6)
+        }
+        .foregroundStyle(.white.opacity(0.75))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(
+            Capsule()
+                .fill(ChatTheme.mint.opacity(0.08))
+                .overlay(
+                    Capsule()
+                        .strokeBorder(ChatTheme.mint.opacity(0.24), lineWidth: 0.6)
+                )
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Inférence 100% locale sur cet appareil")
+    }
 
-    private var messageList: some View {
+    // MARK: - Empty state
+
+    private var emptyState: some View {
         ScrollView {
-            LazyVStack(spacing: 4) {
-                ForEach(viewModel.messages) { message in
-                    MessageBubble(
-                        message: message,
-                        accentColor: accentColor,
-                        morphNamespace: composerNamespace,
-                        morphFromComposer: message.id == viewModel.lastSubmittedUserMessageID,
-                        onEdit: { newText in
-                            viewModel.editMessage(id: message.id, newText: newText)
-                        },
-                        onRegenerate: {
-                            viewModel.regenerate(from: message.id)
-                        }
+            VStack(spacing: 24) {
+                Spacer(minLength: 28)
+
+                // Hero glowing badge
+                ZStack {
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: [
+                                    ChatTheme.auroraCyan.opacity(0.22),
+                                    ChatTheme.electricBlue.opacity(0.08),
+                                    .clear
+                                ],
+                                center: .center,
+                                startRadius: 20,
+                                endRadius: 75
+                            )
+                        )
+                        .frame(width: 140, height: 140)
+
+                    Circle()
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.35),
+                                    ChatTheme.auroraCyan.opacity(0.2),
+                                    Color.clear
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                        .frame(width: 96, height: 96)
+
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    ChatTheme.auroraCyan.opacity(0.18),
+                                    ChatTheme.electricBlue.opacity(0.10)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 84, height: 84)
+
+                    Image(systemName: "stethoscope")
+                        .font(.system(size: 40, weight: .light))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [ChatTheme.auroraCyan, ChatTheme.sky],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                }
+                .shadow(color: ChatTheme.electricBlue.opacity(0.32), radius: 28)
+
+                // Title & Subtitle
+                VStack(spacing: 8) {
+                    Text("Comment puis-je vous aider ?")
+                        .font(ChatTheme.emptyStateTitle)
+                        .foregroundStyle(.white.opacity(0.96))
+
+                    Text("Posez vos questions sur vos symptômes, médicaments ou bilans.\nTous les calculs restent strictement privés sur cet appareil.")
+                        .font(ChatTheme.emptyStateBody)
+                        .foregroundStyle(.white.opacity(0.52))
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(3.5)
+                }
+                .padding(.horizontal, 24)
+
+                // Quick Prompt Cards
+                VStack(spacing: 11) {
+                    promptCard(
+                        title: "Analyse de symptômes",
+                        subtitle: "Maux de tête, fièvre, douleurs musculaires, fatigue",
+                        icon: "stethoscope",
+                        tint: ChatTheme.auroraCyan,
+                        query: "J'aimerais analyser des symptômes récents."
+                    )
+
+                    promptCard(
+                        title: "Guide des médicaments",
+                        subtitle: "Indications, interactions et effets secondaires",
+                        icon: "pills.fill",
+                        tint: ChatTheme.deepViolet,
+                        query: "Pouvez-vous m'expliquer le mode d'action d'un médicament et ses effets indésirables ?"
+                    )
+
+                    promptCard(
+                        title: "Comprendre une analyse médicale",
+                        subtitle: "Bilan sanguin, numération, constantes et glycémie",
+                        icon: "drop.fill",
+                        tint: ChatTheme.coral,
+                        query: "Aidez-moi à comprendre les valeurs de mon dernier bilan sanguin."
+                    )
+
+                    promptCard(
+                        title: "Préparer ma consultation",
+                        subtitle: "Lister les questions ciblées pour mon médecin",
+                        icon: "list.clipboard.fill",
+                        tint: ChatTheme.emerald,
+                        query: "Aidez-moi à préparer une liste de questions ciblées pour mon prochain rendez-vous médical."
                     )
                 }
+                .padding(.horizontal, 16)
+
+                Spacer(minLength: 28)
             }
+            .frame(maxWidth: 560)
+            .frame(maxWidth: .infinity)
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    private func promptCard(
+        title: String,
+        subtitle: String,
+        icon: String,
+        tint: Color,
+        query: String
+    ) -> some View {
+        Button {
+            HapticsHelper.playLightImpact()
+            viewModel.sendMessage(query)
+        } label: {
+            HStack(spacing: 14) {
+                // Tinted Icon Badge
+                ZStack {
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(tint.opacity(0.16))
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .strokeBorder(tint.opacity(0.3), lineWidth: 0.7)
+                    Image(systemName: icon)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(tint)
+                }
+                .frame(width: 40, height: 40)
+
+                // Texts
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.92))
+
+                    Text(subtitle)
+                        .font(.system(size: 12, weight: .regular, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.48))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.28))
+            }
+            .padding(.horizontal, 14)
             .padding(.vertical, 12)
-            .scrollTargetLayout()
-            .animation(.spring(response: 0.45, dampingFraction: 0.75), value: viewModel.messages.count)
-        }
-        .scrollPosition(id: $scrollPosition, anchor: .bottom)
-        .defaultScrollAnchor(.bottom)
-        .scrollDismissesKeyboard(.interactively)
-        .onChange(of: viewModel.messages.count) { _, _ in
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.75)) {
-                scrollPosition = viewModel.messages.last?.id
-            }
-        }
-    }
-
-    // MARK: - Error Banner
-
-    private func errorBanner(_ text: String) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.caption)
-            Text(text)
-                .font(.caption)
-        }
-        .foregroundStyle(.red)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .background(Color.red.opacity(0.12), in: Capsule())
-        .padding(.horizontal)
-        .padding(.bottom, 4)
-        .transition(.move(edge: .top).combined(with: .opacity))
-    }
-
-    // MARK: - Input Bar
-
-    private var inputBar: some View {
-        VStack(spacing: 8) {
-            // The floating pill
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Ask a medical question…", text: $viewModel.currentInput, axis: .vertical)
-                    .font(.system(size: 16, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.96))
-                    .lineLimit(1...5)
-                    .focused($inputFocused)
-                    .disabled(viewModel.isGenerating)
-                    .submitLabel(.send)
-                    .onSubmit {
-                        viewModel.sendMessage()
-                        inputFocused = false
-                    }
-                    .tint(accentColor)
-                    .padding(.vertical, 14)
-                    .padding(.leading, 18)
-
-                sendButton
-                    .padding(.trailing, 8)
-                    .padding(.bottom, 6)
-            }
             .background(
-                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(.ultraThinMaterial)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 26, style: .continuous)
-                            .strokeBorder(ChatTheme.glassStroke, lineWidth: ChatTheme.glassLineWidth)
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.white.opacity(0.025))
                     )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 26, style: .continuous)
-                            .strokeBorder(accentColor.opacity(inputFocused ? 0.3 : 0.0), lineWidth: 0.8)
-                    )
-                    .shadow(color: Color.black.opacity(0.18), radius: 14, y: 6)
             )
-            .padding(.horizontal, 14)
-
-            // Disclaimer
-            Text("⚕️ Not medical advice · 100% Local Inference · Data remains on device")
-                .font(.system(size: 10, weight: .medium, design: .rounded))
-                .foregroundStyle(.white.opacity(0.35))
-                .padding(.bottom, 6)
-        }
-        .padding(.top, 4)
-        // Stable frame for the composer morph
-        .overlay(alignment: .bottomTrailing) {
-            Color.clear
-                .frame(width: 1, height: 1)
-                .matchedGeometryEffect(id: "composerMorph", in: composerNamespace, properties: .frame, anchor: .bottomTrailing, isSource: true)
-        }
-    }
-
-    private var sendButton: some View {
-        Button {
-            if viewModel.isGenerating {
-                viewModel.cancelGeneration()
-            } else {
-                viewModel.sendMessage()
-                inputFocused = false
-            }
-        } label: {
-            Circle()
-                .fill(buttonFill)
-                .frame(width: 32, height: 32)
-                .overlay(
-                    Image(systemName: viewModel.isGenerating ? "stop.fill" : "arrow.up")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(.white)
-                )
-                .shadow(color: buttonShadow, radius: 6, y: 2)
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.16),
+                                tint.opacity(0.12),
+                                Color.white.opacity(0.04)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.6
+                    )
+            )
+            .shadow(color: Color.black.opacity(0.15), radius: 8, y: 3)
         }
         .buttonStyle(.plain)
-        .disabled(!canSend && !viewModel.isGenerating)
-        .animation(.easeInOut(duration: 0.2), value: viewModel.isGenerating)
-        .animation(.easeInOut(duration: 0.2), value: canSend)
     }
 
-    private var buttonFill: AnyShapeStyle {
-        if viewModel.isGenerating {
-            return AnyShapeStyle(Color.red.opacity(0.85))
-        } else if canSend {
-            return AnyShapeStyle(accentGradient)
-        } else {
-            return AnyShapeStyle(.ultraThinMaterial)
+    // MARK: - Messages
+
+    private var messageList: some View {
+        ZStack(alignment: .bottomTrailing) {
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(viewModel.messages) { message in
+                        MessageBubble(
+                            message: message,
+                            accentColor: ChatTheme.electricBlue,
+                            onEdit: { viewModel.editMessage(id: message.id, newText: $0) },
+                            onRegenerate: { viewModel.regenerate(from: message.id) }
+                        )
+                        .id(message.id)
+                    }
+                }
+                .padding(.vertical, 14)
+                .scrollTargetLayout()
+            }
+            .scrollPosition(id: $scrollPosition, anchor: .bottom)
+            .defaultScrollAnchor(.bottom)
+            .scrollDismissesKeyboard(.interactively)
+            .scrollIndicators(.hidden)
+            .onChange(of: scrollPosition) { _, newId in
+                if let lastId = viewModel.messages.last?.id {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isScrolledUp = (newId != nil && newId != lastId)
+                    }
+                }
+            }
+            .onChange(of: viewModel.messages.count) { _, _ in
+                scrollToLatest(animated: true)
+                isScrolledUp = false
+            }
+            .onChange(of: viewModel.messages.last?.text.count) { _, _ in
+                if !isScrolledUp {
+                    scrollToLatest(animated: false)
+                }
+            }
+
+            // Floating scroll to bottom button
+            if isScrolledUp {
+                Button {
+                    HapticsHelper.playLightImpact()
+                    scrollToLatest(animated: true)
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isScrolledUp = false
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 12, weight: .bold))
+                        Text("Dernier message")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(
+                        Capsule().strokeBorder(ChatTheme.auroraCyan.opacity(0.4), lineWidth: 0.8)
+                    )
+                    .shadow(color: ChatTheme.electricBlue.opacity(0.35), radius: 8, y: 3)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 16)
+                .padding(.bottom, 12)
+                .transition(.scale.combined(with: .opacity))
+            }
         }
     }
 
-    private var buttonShadow: Color {
-        if viewModel.isGenerating {
-            return .red.opacity(0.3)
-        } else if canSend {
-            return accentColor.opacity(0.3)
+    private func scrollToLatest(animated: Bool) {
+        guard let id = viewModel.messages.last?.id else { return }
+        if animated && !reduceMotion {
+            withAnimation(.snappy(duration: 0.28)) { scrollPosition = id }
         } else {
-            return .clear
+            scrollPosition = id
         }
     }
 
-    private var canSend: Bool {
-        !viewModel.currentInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private func errorBanner(_ text: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(ChatTheme.amber)
+            Text(text)
+                .lineLimit(2)
+        }
+        .font(.caption)
+        .foregroundStyle(ChatTheme.amber)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(ChatTheme.amber.opacity(0.12), in: Capsule())
+        .overlay(Capsule().strokeBorder(ChatTheme.amber.opacity(0.25), lineWidth: 0.5))
+        .padding(.horizontal)
+        .padding(.bottom, 6)
+    }
+
+    // MARK: - Authentication
+
+    private func authenticate() {
+        guard !isAuthenticating else { return }
+        isAuthenticating = true
+        authenticationMessage = nil
+
+        let context = LAContext()
+        context.localizedCancelTitle = "Plus tard"
+        var policyError: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError) else {
+            isAuthenticating = false
+            isUnlocked = true
+            return
+        }
+
+        context.evaluatePolicy(
+            .deviceOwnerAuthentication,
+            localizedReason: "Déverrouillez vos conversations médicales privées."
+        ) { success, error in
+            DispatchQueue.main.async {
+                isAuthenticating = false
+                isUnlocked = success
+                if !success, let error {
+                    authenticationMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private var lockScreen: some View {
+        ZStack {
+            ChatBackground()
+                .ignoresSafeArea()
+
+            VStack(spacing: 26) {
+                // Biometric badge
+                ZStack {
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: [
+                                    ChatTheme.auroraCyan.opacity(0.25),
+                                    ChatTheme.electricBlue.opacity(0.08),
+                                    .clear
+                                ],
+                                center: .center,
+                                startRadius: 15,
+                                endRadius: 70
+                            )
+                        )
+                        .frame(width: 130, height: 130)
+
+                    Circle()
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.3), ChatTheme.auroraCyan.opacity(0.2), .clear],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                        .frame(width: 96, height: 96)
+
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 42, weight: .light))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(ChatTheme.auroraCyan)
+                }
+                .shadow(color: ChatTheme.electricBlue.opacity(0.32), radius: 24)
+
+                VStack(spacing: 7) {
+                    Text("MedLLM est verrouillé")
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(.white)
+
+                    Text("Vos consultations médicales sont chiffrées\net stockées exclusivement sur cet appareil.")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.55))
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(3)
+                }
+
+                if let authenticationMessage {
+                    Text(authenticationMessage)
+                        .font(.caption)
+                        .foregroundStyle(ChatTheme.amber)
+                        .multilineTextAlignment(.center)
+                }
+
+                Button(action: authenticate) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "faceid")
+                            .font(.system(size: 16, weight: .semibold))
+                        Text(isAuthenticating ? "Déverrouillage…" : "Déverrouiller MedLLM")
+                            .font(.system(.body, design: .rounded, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 14)
+                    .background(ChatTheme.accentGradient(load: 0), in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6)
+                    )
+                    .shadow(color: ChatTheme.electricBlue.opacity(0.38), radius: 16, y: 4)
+                }
+                .buttonStyle(.plain)
+                .disabled(isAuthenticating)
+            }
+            .padding(32)
+        }
     }
 }
 
-// MARK: - Keyboard Helper
+/// A visually rich but static background. Keeping it independent from the
+/// observable chat model prevents token updates from rebuilding its layers.
+struct ChatBackground: View {
+    var body: some View {
+        ZStack {
+            MeshGradient(
+                width: 3,
+                height: 3,
+                points: [
+                    [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+                    [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
+                    [0.0, 1.0], [0.5, 1.0], [1.0, 1.0],
+                ],
+                colors: [
+                    ChatTheme.navy, ChatTheme.indigo, ChatTheme.navy,
+                    ChatTheme.deepViolet.opacity(0.52), ChatTheme.backgroundBase, ChatTheme.teal.opacity(0.42),
+                    ChatTheme.indigo.opacity(0.70), ChatTheme.navy, ChatTheme.teal.opacity(0.30),
+                ]
+            )
 
-#if canImport(UIKit)
-extension View {
-    func hideKeyboard() {
-        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
-                                        to: nil, from: nil, for: nil)
+            // Ambient glowing orbs for depth
+            VStack {
+                Circle()
+                    .fill(ChatTheme.auroraCyan.opacity(0.08))
+                    .frame(width: 280, height: 280)
+                    .blur(radius: 60)
+                    .offset(x: -80, y: -60)
+
+                Spacer()
+
+                Circle()
+                    .fill(ChatTheme.deepViolet.opacity(0.12))
+                    .frame(width: 320, height: 320)
+                    .blur(radius: 80)
+                    .offset(x: 90, y: 80)
+            }
+
+            LinearGradient(
+                colors: [.clear, Color.black.opacity(0.15), Color.black.opacity(0.40)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        .drawingGroup(opaque: true, colorMode: .linear)
     }
 }
-#endif
-
-// MARK: - Preview
 
 #Preview {
-    ContentView()
+    ContentView(viewModel: ChatViewModel(previewMode: true))
 }

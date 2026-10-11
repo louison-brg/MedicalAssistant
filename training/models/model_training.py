@@ -1,173 +1,169 @@
-"""
-MLX LoRA training launcher for this repository.
+"""Reproducible MLX LoRA/QLoRA training launcher.
 
-This script wraps `python -m mlx_lm.lora` and only forwards options
-that are supported by the installed mlx_lm version.
+mlx-lm exposes several important LoRA settings only through its YAML config.
+JSON is a valid YAML subset, so this launcher writes a versionable JSON config
+and invokes the supported unified CLI.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
+import json
 import shlex
 import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Sequence
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch MLX LoRA training.")
-    parser.add_argument("--python", default=sys.executable, help="Python executable to run mlx_lm.lora")
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Launch reproducible MLX LoRA training.")
+    parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--model-path", default="training/models/phi-3-mini-4k-instruct")
     parser.add_argument("--data-path", default="training/data/mlx_data")
     parser.add_argument("--adapter-path", default="training/models/checkpoints_phi3_mlx")
+    parser.add_argument("--config-path", default=None, help="Defaults to <adapter-path>/training_config.json")
 
-    parser.add_argument("--iters", type=int, default=1250)
+    parser.add_argument("--iters", type=int, default=1_250)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--grad-accumulation-steps", type=int, default=4)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-5,
+        help="Peak AdamW learning rate; conservative MLX-LM default for LoRA fine-tuning",
+    )
+    parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--steps-per-report", type=int, default=10)
     parser.add_argument("--steps-per-eval", type=int, default=200)
     parser.add_argument("--val-batches", type=int, default=25)
-    parser.add_argument("--max-seq-length", type=int, default=2048)
-    parser.add_argument("--num-layers", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-seq-length", type=int, default=2_048)
+    parser.add_argument("--num-layers", type=int, default=16, help="Last transformer layers to adapt; -1 means all")
+    parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--lora-rank", type=int, default=8)
-    parser.add_argument("--lora-scale", type=float, default=20.0)
-    parser.add_argument("--lora-dropout", type=float, default=0.0)
-
-    parser.add_argument("--resume-adapter-file", default=None)
-    parser.add_argument("--extra-args", default="", help="Extra raw args forwarded to mlx_lm.lora")
-    parser.add_argument("--dry-run", action="store_true")
-
-    mask_group = parser.add_mutually_exclusive_group()
-    mask_group.add_argument("--mask-prompt", dest="mask_prompt", action="store_true")
-    mask_group.add_argument("--no-mask-prompt", dest="mask_prompt", action="store_false")
-    parser.set_defaults(mask_prompt=True)
-
-    gc_group = parser.add_mutually_exclusive_group()
-    gc_group.add_argument("--grad-checkpoint", dest="grad_checkpoint", action="store_true")
-    gc_group.add_argument("--no-grad-checkpoint", dest="grad_checkpoint", action="store_false")
-    parser.set_defaults(grad_checkpoint=True)
-
-    return parser.parse_args()
-
-
-def discover_supported_flags(python_exec: str) -> set[str]:
-    probe = subprocess.run(
-        [python_exec, "-m", "mlx_lm.lora", "--help"],
-        capture_output=True,
-        text=True,
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=20.0,
+        help="Direct MLX LoRA delta multiplier (not PEFT alpha/r)",
     )
-    if probe.returncode != 0:
-        details = (probe.stdout or "") + "\n" + (probe.stderr or "")
-        raise RuntimeError(
-            "Unable to query mlx_lm.lora help. Install MLX dependencies first.\n"
-            "Try: pip install -r requirements-macos.txt\n\n"
-            f"Details:\n{details.strip()}"
-        )
-
-    text = (probe.stdout or "") + "\n" + (probe.stderr or "")
-    return set(re.findall(r"--[a-zA-Z0-9][a-zA-Z0-9-]*", text))
-
-
-def _append_option(
-    cmd: list[str],
-    supported: set[str],
-    aliases: Sequence[str],
-    value: Optional[object] = None,
-    bool_flag: bool = False,
-) -> Optional[str]:
-    for flag in aliases:
-        if flag not in supported:
-            continue
-        if bool_flag:
-            if bool(value):
-                cmd.append(flag)
-            return flag
-
-        if value is not None:
-            cmd.extend([flag, str(value)])
-        return flag
-    return None
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora-keys",
+        default="",
+        help="Optional comma-separated module paths. Empty uses mlx-lm model defaults.",
+    )
+    parser.add_argument("--resume-adapter-file", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args(argv)
 
 
-def _validate_data_path(data_path: Path) -> None:
-    if data_path.is_dir():
-        train = data_path / "train.jsonl"
-        valid = data_path / "valid.jsonl"
-        if not train.exists() or not valid.exists():
-            raise FileNotFoundError(
-                f"Missing train/valid JSONL files in {data_path}. Expected train.jsonl and valid.jsonl"
+def validate_args(args: argparse.Namespace) -> None:
+    model = Path(args.model_path)
+    data = Path(args.data_path)
+    if not model.exists():
+        raise FileNotFoundError(f"Model path not found: {model}")
+    for name in ("train.jsonl", "valid.jsonl"):
+        file = data / name
+        if not file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {file}")
+        with file.open(encoding="utf-8") as handle:
+            first_line = next((line for line in handle if line.strip()), None)
+        if not first_line:
+            raise ValueError(f"Dataset file is empty: {file}")
+        sample = json.loads(first_line)
+        messages = sample.get("messages")
+        if not messages or messages[-1].get("role") != "assistant":
+            raise ValueError(
+                f"{file} must use mlx-lm chat format and end each sample with an assistant message"
             )
-    elif not data_path.exists():
-        raise FileNotFoundError(f"Data path not found: {data_path}")
+    if args.iters <= 0 or args.batch_size <= 0 or args.grad_accumulation_steps <= 0:
+        raise ValueError("iters, batch size, and gradient accumulation must be positive")
+    if args.lora_rank <= 0 or args.lora_scale <= 0:
+        raise ValueError("LoRA rank and scale must be positive")
+    if args.warmup_steps < 0 or args.warmup_steps >= args.iters:
+        raise ValueError("warmup-steps must be >= 0 and smaller than iters")
 
 
-def build_command(args: argparse.Namespace, supported: set[str]) -> list[str]:
-    data_path = Path(args.data_path)
-    _validate_data_path(data_path)
+def build_config(args: argparse.Namespace) -> dict:
+    lora_parameters: dict[str, object] = {
+        "rank": args.lora_rank,
+        "scale": args.lora_scale,
+        "dropout": args.lora_dropout,
+    }
+    keys = [key.strip() for key in args.lora_keys.split(",") if key.strip()]
+    if keys:
+        lora_parameters["keys"] = keys
 
-    adapter_path = Path(args.adapter_path)
-    adapter_path.mkdir(parents=True, exist_ok=True)
+    decay_steps = max(1, args.iters - args.warmup_steps)
+    return {
+        "model": args.model_path,
+        "train": True,
+        "fine_tune_type": "lora",
+        "data": args.data_path,
+        "seed": args.seed,
+        "num_layers": args.num_layers,
+        "batch_size": args.batch_size,
+        "grad_accumulation_steps": args.grad_accumulation_steps,
+        "iters": args.iters,
+        "val_batches": args.val_batches,
+        "learning_rate": args.learning_rate,
+        "lr_schedule": {
+            "name": "cosine_decay",
+            "arguments": [args.learning_rate, decay_steps],
+            "warmup": args.warmup_steps,
+            "warmup_init": args.learning_rate * 0.1,
+        },
+        "optimizer": "adamw",
+        "optimizer_config": {
+            "adam": {},
+            "adamw": {"weight_decay": args.weight_decay},
+            "muon": {},
+            "sgd": {},
+            "adafactor": {},
+        },
+        "steps_per_report": args.steps_per_report,
+        "steps_per_eval": args.steps_per_eval,
+        "adapter_path": args.adapter_path,
+        "save_every": args.save_every,
+        "max_seq_length": args.max_seq_length,
+        "grad_checkpoint": True,
+        "mask_prompt": True,
+        "resume_adapter_file": args.resume_adapter_file,
+        "lora_parameters": lora_parameters,
+    }
 
-    cmd: list[str] = [args.python, "-m", "mlx_lm.lora"]
 
-    _append_option(cmd, supported, ["--model"], args.model_path)
-    _append_option(cmd, supported, ["--data"], args.data_path)
-    _append_option(cmd, supported, ["--adapter-path"], args.adapter_path)
-    _append_option(cmd, supported, ["--resume-adapter-file", "--resume-adapter"], args.resume_adapter_file)
-
-    # Training mode
-    _append_option(cmd, supported, ["--train"], True, bool_flag=True)
-
-    # Main hyperparameters
-    _append_option(cmd, supported, ["--iters", "--num-iters"], args.iters)
-    _append_option(cmd, supported, ["--batch-size"], args.batch_size)
-    _append_option(cmd, supported, ["--learning-rate", "--lr"], args.learning_rate)
-    _append_option(cmd, supported, ["--save-every"], args.save_every)
-    _append_option(cmd, supported, ["--steps-per-report"], args.steps_per_report)
-    _append_option(cmd, supported, ["--steps-per-eval"], args.steps_per_eval)
-    _append_option(cmd, supported, ["--val-batches"], args.val_batches)
-    _append_option(cmd, supported, ["--max-seq-length", "--max-length"], args.max_seq_length)
-    _append_option(cmd, supported, ["--num-layers", "--lora-layers"], args.num_layers)
-    _append_option(cmd, supported, ["--seed"], args.seed)
-
-    # LoRA options (version-dependent names)
-    _append_option(cmd, supported, ["--lora-rank", "--rank"], args.lora_rank)
-    _append_option(cmd, supported, ["--lora-scale", "--lora-alpha", "--alpha"], args.lora_scale)
-    _append_option(cmd, supported, ["--lora-dropout", "--dropout"], args.lora_dropout)
-
-    # Bool options
-    _append_option(cmd, supported, ["--mask-prompt"], args.mask_prompt, bool_flag=True)
-    _append_option(cmd, supported, ["--grad-checkpoint"], args.grad_checkpoint, bool_flag=True)
-
-    if args.extra_args.strip():
-        cmd.extend(shlex.split(args.extra_args.strip()))
-
-    return cmd
+def command_for(args: argparse.Namespace, config_path: Path) -> list[str]:
+    return [args.python, "-m", "mlx_lm", "lora", "--config", str(config_path)]
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
     try:
-        supported = discover_supported_flags(args.python)
-        command = build_command(args, supported)
-    except Exception as exc:
-        print(f"❌ {exc}")
+        validate_args(args)
+        installed_version = version("mlx-lm")
+    except (ValueError, FileNotFoundError, PackageNotFoundError) as error:
+        print(f"Error: {error}", file=sys.stderr)
         return 1
 
-    print("🚀 Launching MLX LoRA training:")
-    print(" ".join(shlex.quote(part) for part in command))
+    config = build_config(args)
+    config_path = Path(args.config_path or Path(args.adapter_path) / "training_config.json")
+    command = command_for(args, config_path)
+    print(f"mlx-lm {installed_version}")
+    print(json.dumps(config, indent=2, ensure_ascii=False))
+    print("Command:", " ".join(shlex.quote(part) for part in command))
 
     if args.dry_run:
-        print("ℹ️ Dry run only.")
         return 0
 
-    process = subprocess.run(command)
-    return process.returncode
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return subprocess.run(command, check=False).returncode
 
 
 if __name__ == "__main__":
