@@ -6,9 +6,9 @@ struct ChatComposer: View {
     let isGenerating: Bool
     let onSend: (String) -> Void
     let onStop: () -> Void
+    @FocusState.Binding var isFocused: Bool
 
     @State private var draft = ""
-    @FocusState private var isFocused: Bool
 
     private var canSend: Bool {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -40,6 +40,21 @@ struct ChatComposer: View {
                     .tint(ChatTheme.auroraCyan)
                     .padding(.leading, 18)
                     .padding(.vertical, 12)
+
+                // Quick dismiss keyboard button when typing
+                if isFocused {
+                    Button {
+                        isFocused = false
+                    } label: {
+                        Image(systemName: "keyboard.chevron.compact.down")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 12)
+                    .transition(.opacity.combined(with: .scale))
+                    .accessibilityLabel("Masquer le clavier")
+                }
 
                 // Clear button
                 if !draft.isEmpty && !isGenerating {
@@ -134,20 +149,24 @@ struct ChatComposer: View {
             .animation(.easeInOut(duration: 0.2), value: isFocused)
             .padding(.horizontal, 14)
 
-            // Security & offline guarantee footer
-            HStack(spacing: 6) {
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(ChatTheme.emerald)
+            // Security & offline guarantee footer (automatically hidden when keyboard is open to preserve vertical space)
+            if !isFocused {
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(ChatTheme.emerald)
 
-                Text("100% Hors-ligne · Confidentialité totale · Non diagnostique")
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .tracking(0.3)
-                    .foregroundStyle(.white.opacity(0.38))
+                    Text("100% Hors-ligne · Confidentialité totale · Non diagnostique")
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .tracking(0.3)
+                        .foregroundStyle(.white.opacity(0.38))
+                }
+                .padding(.bottom, 4)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
-            .padding(.bottom, 4)
         }
         .padding(.top, 4)
+        .animation(.snappy(duration: 0.25), value: isFocused)
     }
 
     private func primaryAction() {

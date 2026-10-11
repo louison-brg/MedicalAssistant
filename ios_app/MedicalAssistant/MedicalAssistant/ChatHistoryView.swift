@@ -80,13 +80,15 @@ struct ChatHistoryView: View {
                     .accessibilityLabel("Nouvelle conversation")
                 }
             }
-            .alert("Renommer la discussion", isPresented: $isShowingRenameAlert) {
-                TextField("Titre de la consultation", text: $renameText)
-                Button("Annuler", role: .cancel) {}
-                Button("Enregistrer") {
-                    if let session = sessionToRename {
-                        viewModel.renameSession(id: session.id, newTitle: renameText)
-                    }
+            .overlay {
+                if isShowingRenameAlert, let session = sessionToRename {
+                    RenameSessionDialog(
+                        isPresented: $isShowingRenameAlert,
+                        title: session.title,
+                        onSave: { newTitle in
+                            viewModel.renameSession(id: session.id, newTitle: newTitle)
+                        }
+                    )
                 }
             }
             .confirmationDialog(
@@ -198,6 +200,7 @@ struct ChatHistoryView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
+        .scrollDismissesKeyboard(.interactively)
     }
 
     private func sessionCard(_ session: ChatSession) -> some View {

@@ -6,6 +6,8 @@ struct ContentView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var viewModel: ChatViewModel
 
+    @FocusState private var isComposerFocused: Bool
+
     @State private var isUnlocked = false
     @State private var isAuthenticating = false
     @State private var authenticationMessage: String?
@@ -18,7 +20,11 @@ struct ContentView: View {
     @State private var isScrolledUp = false
 
     init() {
-        _viewModel = StateObject(wrappedValue: ChatViewModel())
+        if ProcessInfo.processInfo.arguments.contains("-previewData") {
+            _viewModel = StateObject(wrappedValue: ChatViewModel(previewMode: true))
+        } else {
+            _viewModel = StateObject(wrappedValue: ChatViewModel())
+        }
     }
 
     init(viewModel: ChatViewModel) {
@@ -51,13 +57,10 @@ struct ContentView: View {
     // MARK: - Main chat
 
     private var chat: some View {
-        ZStack {
-            ChatBackground()
-                .ignoresSafeArea()
+        VStack(spacing: 0) {
+            header
 
-            VStack(spacing: 0) {
-                header
-
+            ZStack {
                 if viewModel.messages.isEmpty {
                     emptyState
                 } else {
@@ -65,16 +68,29 @@ struct ContentView: View {
                 }
 
                 if let error = viewModel.errorMessage {
-                    errorBanner(error)
+                    VStack {
+                        errorBanner(error)
+                        Spacer()
+                    }
                 }
             }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
             ChatComposer(
                 isGenerating: viewModel.isGenerating,
                 onSend: viewModel.sendMessage,
-                onStop: viewModel.cancelGeneration
+                onStop: viewModel.cancelGeneration,
+                isFocused: $isComposerFocused
             )
+            .padding(.bottom, isComposerFocused ? 8 : 4)
+        }
+        .background {
+            ChatBackground()
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    isComposerFocused = false
+                }
         }
         .sheet(isPresented: $showingHistory) {
             ChatHistoryView(viewModel: viewModel)
@@ -90,13 +106,17 @@ struct ContentView: View {
             .presentationDragIndicator(.visible)
             .presentationBackground(.ultraThinMaterial)
         }
-        .alert("Renommer la discussion", isPresented: $showingRenameDialog) {
-            TextField("Titre de la consultation", text: $renameText)
-            Button("Annuler", role: .cancel) {}
-            Button("Enregistrer") {
-                if let id = viewModel.activeSessionId {
-                    viewModel.renameSession(id: id, newTitle: renameText)
-                }
+        .overlay {
+            if showingRenameDialog {
+                RenameSessionDialog(
+                    isPresented: $showingRenameDialog,
+                    title: renameText,
+                    onSave: { newTitle in
+                        if let id = viewModel.activeSessionId {
+                            viewModel.renameSession(id: id, newTitle: newTitle)
+                        }
+                    }
+                )
             }
         }
         .confirmationDialog(
@@ -120,6 +140,7 @@ struct ContentView: View {
     private var header: some View {
         HStack(spacing: 10) {
             headerButton(systemName: "line.3.horizontal") {
+                isComposerFocused = false
                 HapticsHelper.playLightImpact()
                 showingHistory = true
             }
@@ -127,6 +148,7 @@ struct ContentView: View {
 
             // Brand avatar (tappable for disclaimer & emergency info)
             Button {
+                isComposerFocused = false
                 HapticsHelper.playLightImpact()
                 showingMedicalInfo = true
             } label: {
@@ -145,8 +167,11 @@ struct ContentView: View {
 
             // Title and offline indicator
             Button {
+                isComposerFocused = false
                 renameText = activeSessionTitle
-                showingRenameDialog = true
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showingRenameDialog = true
+                }
             } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 4) {
@@ -175,6 +200,7 @@ struct ContentView: View {
             Spacer(minLength: 6)
 
             Button {
+                isComposerFocused = false
                 showingMedicalInfo = true
             } label: {
                 privacyBadge
@@ -190,61 +216,60 @@ struct ContentView: View {
                 }
 
                 Button {
+                    isComposerFocused = false
                     renameText = activeSessionTitle
-                    showingRenameDialog = true
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showingRenameDialog = true
+                    }
                 } label: {
                     Label("Renommer la discussion", systemImage: "pencil")
                 }
 
                 Button {
+                    isComposerFocused = false
                     showingMedicalInfo = true
                 } label: {
-                    Label("Urgences & Avertissement", systemImage: "cross.case")
+                    Label("Avertissement médical", systemImage: "info.circle")
                 }
 
                 if !viewModel.messages.isEmpty {
                     Divider()
+
                     Button(role: .destructive) {
+                        isComposerFocused = false
                         showingClearConfirmation = true
                     } label: {
-                        Label("Effacer les messages", systemImage: "trash")
+                        Label("Effacer la discussion", systemImage: "trash")
                     }
                 }
             } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.85))
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 20))
+                    .foregroundStyle(.white.opacity(0.8))
                     .frame(width: 36, height: 36)
-                    .background(
-                        Circle()
-                            .fill(.ultraThinMaterial)
-                            .overlay(
-                                Circle().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
-                            )
-                    )
-                    .shadow(color: Color.black.opacity(0.15), radius: 4, y: 2)
             }
 
+            // New chat button
             headerButton(systemName: "square.and.pencil") {
+                isComposerFocused = false
                 HapticsHelper.playLightImpact()
                 withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) {
                     viewModel.createNewSession()
                 }
             }
-            .accessibilityLabel("Nouvelle conversation")
+            .accessibilityLabel("Nouvelle consultation")
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 10)
-        .padding(.bottom, 12)
-        .background(.ultraThinMaterial)
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.bottom, 10)
+        .background {
+            Rectangle()
+                .fill(.ultraThinMaterial.opacity(0.85))
+                .ignoresSafeArea(edges: .top)
+        }
         .overlay(alignment: .bottom) {
             LinearGradient(
-                colors: [
-                    .clear,
-                    ChatTheme.auroraCyan.opacity(0.3),
-                    ChatTheme.electricBlue.opacity(0.15),
-                    .clear
-                ],
+                colors: [Color.white.opacity(0.12), Color.white.opacity(0.02)],
                 startPoint: .leading,
                 endPoint: .trailing
             )
@@ -420,6 +445,14 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
         }
         .scrollIndicators(.hidden)
+        .scrollDismissesKeyboard(.interactively)
+        .background(
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    isComposerFocused = false
+                }
+        )
     }
 
     private func promptCard(
@@ -430,6 +463,7 @@ struct ContentView: View {
         query: String
     ) -> some View {
         Button {
+            isComposerFocused = false
             HapticsHelper.playLightImpact()
             viewModel.sendMessage(query)
         } label: {
@@ -517,6 +551,13 @@ struct ContentView: View {
             .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
             .scrollIndicators(.hidden)
+            .background(
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        isComposerFocused = false
+                    }
+            )
             .onChange(of: scrollPosition) { _, newId in
                 if let lastId = viewModel.messages.last?.id {
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -596,6 +637,10 @@ struct ContentView: View {
 
     private func authenticate() {
         guard !isAuthenticating else { return }
+        if ProcessInfo.processInfo.arguments.contains("-uitesting") || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            isUnlocked = true
+            return
+        }
         isAuthenticating = true
         authenticationMessage = nil
 

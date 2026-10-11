@@ -5,7 +5,12 @@ import SwiftUI
 /// again, while returning from the background still uses the biometric lock.
 struct LaunchGateView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var didAcknowledgeDisclaimer = false
+    @State private var didAcknowledgeDisclaimer: Bool
+
+    init() {
+        let isTesting = ProcessInfo.processInfo.arguments.contains("-uitesting") || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        _didAcknowledgeDisclaimer = State(initialValue: isTesting)
+    }
 
     var body: some View {
         Group {
